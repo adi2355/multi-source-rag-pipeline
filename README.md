@@ -129,7 +129,7 @@ The system operates as a seven-layer pipeline. Data flows from collection throug
 
 ## Multi-Source Ingestion
 
-### Instagram Video Pipeline
+### Platform Video Pipeline
 
 The scraper uses instaloader with proxy rotation, account credential cycling, and rate-limit detection with configurable cooldown periods. Account state is tracked persistently in JSON files. Audio is extracted and transcribed locally using OpenAI Whisper, producing timestamped transcript segments.
 
@@ -186,19 +186,14 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 
 ## Hardest Problems Solved
 
-### 1. Scraping Hostile Platforms at Scale
 
-**Problem:** Instagram actively detects and blocks automated access. Rate limits, IP bans, CAPTCHA challenges, and session invalidation make reliable data collection non-trivial.
-
-**Solution:** The scraper implements a multi-layer resilience strategy: rotating proxy pools, account credential cycling with persistent state tracking, adaptive cooldown periods that back off on detection signals, and graceful degradation that preserves partial progress. Account state (active, rate-limited, banned) is tracked per-session and persisted across runs.
-
-### 2. Adaptive Retrieval Without Manual Tuning
+### 1. Adaptive Retrieval Without Manual Tuning
 
 **Problem:** A fixed vector-to-keyword weight ratio works well for some query types and poorly for others. Code queries need strong keyword matching; conceptual queries need strong semantic matching. Manual tuning does not scale.
 
 **Solution:** The hybrid search system classifies each incoming query, applies a base weight configuration for the detected query type, then adjusts further based on query-specific signals (length, quoted phrases, code tokens). A feedback loop records user interactions and learns which weight patterns produce the best results for observed query distributions, progressively refining the default weights.
 
-### 3. Structured Knowledge from Unstructured Text
+### 2. Structured Knowledge from Unstructured Text
 
 **Problem:** Video transcripts and research papers contain latent concept relationships invisible to keyword and vector search. "Attention mechanism" and "transformer architecture" are deeply related, but a document about one may never mention the other by name.
 
