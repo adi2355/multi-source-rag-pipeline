@@ -226,11 +226,11 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 
 | Document | Focus Area |
 | :--- | :--- |
-| **[RAG Pipeline](Instagram-Scraper/README_RAG.md)** | End-to-end RAG usage, CLI commands, query API |
-| **[Knowledge Graph](Instagram-Scraper/README_KNOWLEDGE_GRAPH.md)** | Concept extraction, graph analysis, visualization |
-| **[Vector and Hybrid Search](Instagram-Scraper/README_VECTOR_SEARCH.md)** | Embedding generation, search strategies, adaptive weighting |
-| **[ArXiv Collector](Instagram-Scraper/README_arxiv_collector.md)** | Paper collection, OCR pipeline, batch processing |
-| **[Application Guide](Instagram-Scraper/README.md)** | Installation, configuration, CLI usage, web interface |
+| **[RAG Pipeline](src/README_RAG.md)** | End-to-end RAG usage, CLI commands, query API |
+| **[Knowledge Graph](src/README_KNOWLEDGE_GRAPH.md)** | Concept extraction, graph analysis, visualization |
+| **[Vector and Hybrid Search](src/README_VECTOR_SEARCH.md)** | Embedding generation, search strategies, adaptive weighting |
+| **[ArXiv Collector](src/README_arxiv_collector.md)** | Paper collection, OCR pipeline, batch processing |
+| **[Application Guide](src/README.md)** | Installation, configuration, CLI usage, web interface |
 
 ---
 
@@ -268,7 +268,7 @@ Results are viewable through an interactive evaluation dashboard.
 <br>
 
 ```
-Instagram-Scraper/
+src/
 ├── run.py                          --- CLI entry point
 ├── app.py                          --- Flask web interface
 ├── downloader.py                   --- Instagram scraper, proxy rotation, rate limiting
