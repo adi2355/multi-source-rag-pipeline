@@ -17,6 +17,22 @@ from typing import List, Dict, Any, Union, Optional, Tuple
 import config
 from chunking import chunk_text, prepare_content_for_embedding
 
+
+# Environment required to fan out writes to Mosaic AI Vector Search. If
+# any of these are missing, ingestion proceeds with SQLite only (SQLite
+# is the canonical source of truth; VS is a derived index rebuildable
+# from SQLite via a future `reconcile_vs` job).
+_VS_REQUIRED_ENV = (
+    "DATABRICKS_HOST",
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_VS_ENDPOINT",
+    "DATABRICKS_VS_INDEX",
+)
+
+
+def _vs_enabled() -> bool:
+    return all(os.getenv(v) for v in _VS_REQUIRED_ENV)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -195,21 +211,20 @@ class EmbeddingGenerator:
             
             logger.info(f"Generated {len(chunks)} chunks for content ID {content_id}")
             
-            # Process each chunk
+            # Process each chunk — SQLite first (canonical), collect
+            # records for a downstream VS fan-out.
+            vs_records: List[Dict[str, Any]] = []
             for i, chunk in enumerate(chunks):
-                # Generate embedding
                 start_time = time.time()
                 embedding = self.generate_embedding(chunk)
                 elapsed = time.time() - start_time
-                
+
                 logger.debug(f"Generated embedding for chunk {i+1}/{len(chunks)} in {elapsed:.2f}s")
-                
-                # Convert numpy array to binary for storage
+
                 embedding_binary = pickle.dumps(embedding)
-                
-                # Store in database
+
                 cursor.execute("""
-                    INSERT OR REPLACE INTO content_embeddings 
+                    INSERT OR REPLACE INTO content_embeddings
                     (content_id, embedding_vector, embedding_model, chunk_index, chunk_text, date_created)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (
@@ -220,17 +235,32 @@ class EmbeddingGenerator:
                     chunk,
                     datetime.now().isoformat()
                 ))
-            
-            # Update ai_content to mark as processed
+
+                vs_records.append({
+                    "content_id": f"{content_id}:{i}",
+                    "chunk_index": i,
+                    "chunk_text": chunk,
+                    "title": title or "",
+                    "source_type": source_type,
+                    "embedding": embedding.tolist(),
+                })
+
             cursor.execute("""
-                UPDATE ai_content 
+                UPDATE ai_content
                 SET metadata = json.set(COALESCE(metadata, '{}'), '$.embeddings_generated', 1),
                     date_indexed = ?
                 WHERE id = ?
             """, (datetime.now().isoformat(), content_id))
-            
+
             conn.commit()
             logger.info(f"Successfully processed content ID {content_id} with {len(chunks)} embeddings")
+
+            # Fan-out: SQLite is committed; attempt the VS upsert. Failure
+            # here does NOT roll back SQLite — SQLite is canonical. A
+            # reconcile job can replay unwritten content_ids from SQLite.
+            if _vs_enabled():
+                self._upsert_vs(vs_records, content_id)
+
             return True
             
         except Exception as e:
@@ -243,7 +273,31 @@ class EmbeddingGenerator:
             if conn:
                 conn.close()
     
-    def process_batch(self, batch_size: int = 10, max_items: Optional[int] = None, 
+    @staticmethod
+    def _upsert_vs(records: List[Dict[str, Any]], content_id: int) -> None:
+        """Fan-out embeddings to Mosaic AI Vector Search. Called after
+        SQLite commit. VS write failures are logged but do NOT raise —
+        SQLite is the canonical source of truth and a reconcile job can
+        replay unsynced content_ids."""
+        try:
+            # Import is lazy so that local-only dev environments without
+            # the databricks-vectorsearch package are not blocked.
+            from databricks_vector_client import MosaicAIVectorSearchClient  # noqa: E402
+            client = MosaicAIVectorSearchClient()
+            client.upsert(records)
+            logger.info(
+                "Mosaic AI VS upsert succeeded for content_id=%s (%d chunks)",
+                content_id, len(records),
+            )
+        except Exception as e:
+            logger.warning(
+                "Mosaic AI VS upsert FAILED for content_id=%s: %s. "
+                "SQLite remains canonical; re-run ingestion or invoke "
+                "reconcile to sync the index.",
+                content_id, e,
+            )
+
+    def process_batch(self, batch_size: int = 10, max_items: Optional[int] = None,
                      source_type: Optional[str] = None) -> int:
         """
         Process a batch of content items from the database

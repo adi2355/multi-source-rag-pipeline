@@ -31,16 +31,29 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
+# Ensure src/ is on sys.path so we can import the shared governance counter
+# regardless of whether this module is loaded as evaluation.mlflow_eval or
+# directly. This mirrors how the other evaluation modules bootstrap sys.path.
+_THIS_DIR = Path(__file__).resolve().parent
+_SRC_DIR = _THIS_DIR.parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from governance_metrics import record_fallback  # noqa: E402
+
 logger = logging.getLogger("mlflow_eval")
 
 _REQUIRED_ENV = ("DATABRICKS_HOST", "DATABRICKS_TOKEN")
 _FALLBACK_FLAG = "ALLOW_LOCAL_FALLBACK"
-_OFFLINE_DIR = Path("./mlflow_offline")
+# Absolute path prevents offline runs from landing in unexpected directories
+# when callers run from a different CWD (test harnesses, CI, notebooks).
+_OFFLINE_DIR = (_SRC_DIR.parent / "mlflow_offline").resolve()
 
 
 def _fallback_allowed() -> bool:
@@ -81,9 +94,10 @@ class MLflowEvalTracker:
                 "ALLOW_LOCAL_FALLBACK=true so writing runs to %s. Data will "
                 "NOT appear in the Databricks MLflow UI.",
                 ",".join(missing),
-                _OFFLINE_DIR.resolve(),
+                _OFFLINE_DIR,
             )
             self._offline = True
+            record_fallback("mlflow")
             _OFFLINE_DIR.mkdir(parents=True, exist_ok=True)
             return
 

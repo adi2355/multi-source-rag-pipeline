@@ -39,3 +39,4 @@ node_modules
 node_modules
 Instagram-Scraper/data/state/proxy_state.json
 .github_token
+mlflow_offline/

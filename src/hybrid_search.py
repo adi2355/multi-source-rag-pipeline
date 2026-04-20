@@ -16,7 +16,13 @@ from typing import List, Dict, Any, Optional, Tuple, Union
 # Import local modules
 import config
 from embeddings import EmbeddingGenerator
-from vector_search import search_by_text, enrich_search_results
+from vector_search import (
+    search_by_text,
+    enrich_search_results,
+    managed_search_configured,
+    _MANAGED_COLUMNS,
+    _normalize_managed_results,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -25,7 +31,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger('hybrid_search')
 
-def keyword_search(query: str, top_k: int = 10, 
+def _hybrid_search_managed(
+    query: str,
+    top_k: int,
+    source_type: Optional[str],
+    embedding_generator: Optional[EmbeddingGenerator],
+) -> List[Dict[str, Any]]:
+    """Native-hybrid path: one call to Mosaic AI Vector Search with
+    query_type='hybrid'. Server fuses semantic + keyword matching, so the
+    return shape lacks vector_score / keyword_score (the server does not
+    expose per-signal scores). We surface `combined_score` from VS's
+    `score` column and leave per-signal fields at 0.0 with a boolean flag
+    indicating server-side fusion was used."""
+    from databricks_vector_client import MosaicAIVectorSearchClient  # noqa: E402
+
+    if embedding_generator is None:
+        embedding_generator = EmbeddingGenerator()
+    query_embedding = embedding_generator.generate_embedding(query)
+
+    client = MosaicAIVectorSearchClient(columns=_MANAGED_COLUMNS)
+    filters = {"source_type": source_type} if source_type else None
+
+    raw = client.similarity_search(
+        query_text=query,
+        query_vector=query_embedding.tolist(),
+        k=top_k,
+        hybrid=True,
+        filters=filters,
+    )
+    normalized = _normalize_managed_results(raw, query)
+
+    # Map into the shape that hybrid_search callers expect.
+    results = []
+    for row in normalized:
+        results.append({
+            "content_id": row["content_id"],
+            "chunk_index": row["chunk_index"],
+            "chunk_text": row["chunk_text"],
+            "title": row["title"],
+            "source_type": row["source_type"],
+            "query": query,
+            "combined_score": row["similarity"],
+            "vector_score": 0.0,
+            "keyword_score": 0.0,
+            "has_vector_match": True,
+            "has_keyword_match": True,
+            "search_type": "hybrid_managed",
+        })
+    # Still enrich with DB metadata (title, url, concepts) — these live in
+    # SQLite even when retrieval is managed, and enrich_search_results is
+    # graceful if a content_id isn't found locally.
+    return enrich_search_results(results)
+
+
+def keyword_search(query: str, top_k: int = 10,
                   source_type: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Perform keyword search using SQLite FTS
@@ -265,25 +324,48 @@ def determine_weights(query: str) -> Tuple[float, float]:
     
     return vector_weight, keyword_weight
 
-def hybrid_search(query: str, top_k: int = 5, 
+def hybrid_search(query: str, top_k: int = 5,
                  source_type: Optional[str] = None,
                  vector_weight: Optional[float] = None,
                  keyword_weight: Optional[float] = None,
                  embedding_generator: Optional[EmbeddingGenerator] = None) -> List[Dict[str, Any]]:
     """
-    Perform hybrid search combining vector and keyword search
-    
+    Perform hybrid search combining vector and keyword signals.
+
+    In managed mode (all DATABRICKS_VS_* env vars set), delegates to Mosaic
+    AI Vector Search's native `query_type="hybrid"` which performs
+    server-side fusion of semantic + keyword matching — the custom
+    adaptive-weighting + SQLite-FTS5 path below is bypassed entirely. The
+    `vector_weight`/`keyword_weight` parameters are accepted but logged
+    as ignored when managed, since fusion is server-controlled.
+
+    In local mode, runs the original adaptive-weighted fusion of
+    `search_by_text` + SQLite FTS5 `keyword_search`.
+
     Args:
         query: The search query
         top_k: Maximum number of results to return
         source_type: Optional filter for source type
-        vector_weight: Weight for vector search results (0-1)
-        keyword_weight: Weight for keyword search results (0-1)
+        vector_weight: Local-mode only; weight for vector search (0-1)
+        keyword_weight: Local-mode only; weight for keyword search (0-1)
         embedding_generator: Optional pre-initialized embedding generator
-        
+
     Returns:
         List of search results with combined scores
     """
+    if managed_search_configured():
+        if vector_weight is not None or keyword_weight is not None:
+            logger.info(
+                "Managed hybrid search: vector_weight/keyword_weight are "
+                "ignored (fusion is server-side)."
+            )
+        return _hybrid_search_managed(
+            query=query,
+            top_k=top_k,
+            source_type=source_type,
+            embedding_generator=embedding_generator,
+        )
+
     try:
         # Determine weights if not provided
         if vector_weight is None or keyword_weight is None:

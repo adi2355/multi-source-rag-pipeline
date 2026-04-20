@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Sequence
+
+from governance_metrics import record_fallback
 
 logger = logging.getLogger("ai_gateway_client")
 
@@ -74,6 +76,7 @@ class MosaicAIGatewayClient:
                 ",".join(missing),
             )
             self._fallback_active = True
+            record_fallback("gateway")
             return
 
         raise RuntimeError(
@@ -99,28 +102,68 @@ class MosaicAIGatewayClient:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = DEFAULT_TEMPERATURE,
     ) -> str:
-        """Generate a completion for `prompt`. Returns the assistant text."""
+        """Single-prompt convenience. Delegates to chat() with one user message."""
         if not isinstance(prompt, str) or not prompt:
             raise ValueError("prompt must be a non-empty string")
+        return self.chat(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    def chat(
+        self,
+        messages: Sequence[dict],
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float = DEFAULT_TEMPERATURE,
+        system: Optional[str] = None,
+    ) -> str:
+        """
+        Multi-turn chat completion. `messages` is a list of {role, content}
+        dicts; `system` is injected as a leading system message when routed
+        through Gateway, and as the top-level `system` kwarg on the direct
+        Anthropic fallback (Anthropic SDK requires it there).
+        """
+        self._validate_chat_inputs(messages, max_tokens, temperature, system)
+        if self._fallback_active:
+            return self._fallback_chat(messages, max_tokens, temperature, system)
+        return self._gateway_chat(messages, max_tokens, temperature, system)
+
+    @staticmethod
+    def _validate_chat_inputs(messages, max_tokens, temperature, system):
+        if not messages:
+            raise ValueError("messages must be a non-empty sequence")
+        for i, m in enumerate(messages):
+            if not isinstance(m, dict) or "role" not in m or "content" not in m:
+                raise ValueError(
+                    f"messages[{i}] must be a {{role, content}} dict, got {m!r}"
+                )
         if max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
         if not 0.0 <= temperature <= 2.0:
             raise ValueError("temperature must be in [0.0, 2.0]")
+        if system is not None and not isinstance(system, str):
+            raise ValueError("system must be a string or None")
 
-        if self._fallback_active:
-            return self._fallback_generate(prompt, max_tokens, temperature)
-        return self._gateway_generate(prompt, max_tokens, temperature)
-
-    def _gateway_generate(self, prompt: str, max_tokens: int, temperature: float) -> str:
+    def _gateway_chat(
+        self,
+        messages: Sequence[dict],
+        max_tokens: int,
+        temperature: float,
+        system: Optional[str],
+    ) -> str:
         if self._client is None:
             raise RuntimeError(
                 "MosaicAIGatewayClient: gateway client is not initialized. "
                 "This indicates a constructor invariant was violated."
             )
+        payload_messages = list(messages)
+        if system:
+            payload_messages = [{"role": "system", "content": system}, *payload_messages]
         response = self._client.predict(
             endpoint=self.endpoint,
             inputs={
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": payload_messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
             },
@@ -141,7 +184,12 @@ class MosaicAIGatewayClient:
         return content
 
     @staticmethod
-    def _fallback_generate(prompt: str, max_tokens: int, temperature: float) -> str:
+    def _fallback_chat(
+        messages: Sequence[dict],
+        max_tokens: int,
+        temperature: float,
+        system: Optional[str],
+    ) -> str:
         try:
             import anthropic  # type: ignore
         except ImportError as e:
@@ -155,12 +203,15 @@ class MosaicAIGatewayClient:
                 "Fallback path requires ANTHROPIC_API_KEY to be set."
             )
         client = anthropic.Anthropic(api_key=api_key)
-        message = client.messages.create(  # type: ignore[attr-defined]
-            model=os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-3-5-sonnet-latest"),
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        kwargs = {
+            "model": os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-3-5-sonnet-latest"),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": list(messages),
+        }
+        if system:
+            kwargs["system"] = system
+        message = client.messages.create(**kwargs)  # type: ignore[attr-defined]
         return "".join(block.text for block in message.content if hasattr(block, "text"))
 
     @property

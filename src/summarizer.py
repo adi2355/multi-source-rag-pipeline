@@ -13,6 +13,7 @@ from anthropic.types.message_create_params import MessageCreateParamsNonStreamin
 from anthropic.types.messages.batch_create_params import Request
 
 from config import DB_PATH, TRANSCRIPT_DIR, DATA_DIR
+from llm_client import create_message
 
 # Configure logging
 logging.basicConfig(
@@ -251,21 +252,16 @@ CONTENT TYPE: [content type classification]
                 
                 # Create enhanced prompt
                 prompt = self._create_enhanced_prompt(transcript, metadata)
-                
-                # Use the current API pattern for Anthropic v0.49.0
-                response = self.client.messages.create(
-                    model="claude-3-haiku-20240307",  # More cost-effective model for batch processing
+
+                # Single-shot summarization — routes through Mosaic AI Gateway
+                # when DATABRICKS_LLM_ENDPOINT is set. The Message Batches
+                # path elsewhere in this module intentionally stays on the
+                # direct Anthropic SDK (Gateway does not proxy Batches).
+                summary = create_message(
+                    messages=[{"role": "user", "content": prompt}],
                     max_tokens=1024,
-                    messages=[
-                        {
-                            "role": "user", 
-                            "content": prompt
-                        }
-                    ]
+                    model="claude-3-haiku-20240307",
                 )
-                
-                # Get the text content from the response
-                summary = response.content[0].text
                 
                 # Extract structured information from the response
                 structured_data = self._parse_structured_summary(summary)

@@ -24,6 +24,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger('vector_search')
 
+
+# Columns requested from a Mosaic AI Vector Search Direct Access Index.
+# Must match the UC index schema created at provisioning time. If the
+# index schema differs, pass `columns=...` through managed_search_configured
+# or edit this tuple on the deployment branch.
+_MANAGED_COLUMNS = (
+    "content_id",
+    "chunk_index",
+    "chunk_text",
+    "title",
+    "source_type",
+)
+
+
+_MANAGED_REQUIRED_ENV = (
+    "DATABRICKS_HOST",
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_VS_ENDPOINT",
+    "DATABRICKS_VS_INDEX",
+)
+
+
+def managed_search_configured() -> bool:
+    """True iff all four Databricks Vector Search env vars are set.
+
+    This is a stricter gate than just checking DATABRICKS_VS_INDEX on
+    purpose: MosaicAIVectorSearchClient's fallback path calls back into
+    `search_by_text`, so if we dispatched into the VS client in a partial-
+    env + ALLOW_LOCAL_FALLBACK scenario, we would recurse. Requiring full
+    env here means managed dispatch only happens when the VS client won't
+    enter fallback, breaking the recursion cleanly."""
+    return all(os.getenv(v) for v in _MANAGED_REQUIRED_ENV)
+
+
+def _normalize_managed_results(
+    raw_results: List[Dict[str, Any]],
+    query_text: str,
+) -> List[Dict[str, Any]]:
+    """Map Mosaic AI Vector Search row dicts into the local search result
+    shape: {content_id, chunk_index, similarity, chunk_text, title,
+    source_type, query}. Missing server-side columns get safe defaults."""
+    normalized: List[Dict[str, Any]] = []
+    for row in raw_results:
+        normalized.append({
+            "content_id": row.get("content_id"),
+            "chunk_index": row.get("chunk_index", 0),
+            "similarity": float(row.get("score", 0.0)),
+            "chunk_text": row.get("chunk_text", ""),
+            "title": row.get("title", ""),
+            "source_type": row.get("source_type", ""),
+            "query": query_text,
+        })
+    return normalized
+
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
     """
     Calculate cosine similarity between two vectors
@@ -136,32 +190,67 @@ def vector_search(query_embedding: np.ndarray, top_k: int = 5,
 def search_by_text(query_text: str, top_k: int = 5, source_type: Optional[str] = None,
                   embedding_generator: Optional[EmbeddingGenerator] = None) -> List[Dict[str, Any]]:
     """
-    Search for content similar to the query text
-    
+    Search for content similar to the query text.
+
+    Dispatches to Mosaic AI Vector Search when DATABRICKS_VS_INDEX is
+    configured (and the full workspace env is present, or
+    ALLOW_LOCAL_FALLBACK=true). Otherwise runs local SQLite + pickled
+    vector cosine search. The return shape is identical on both paths.
+
     Args:
         query_text: The query text
         top_k: Number of results to return
-        source_type: Optional filter by source type
+        source_type: Optional filter by source type (applied locally or as a
+            VS metadata filter when managed)
         embedding_generator: Optional pre-initialized embedding generator
-        
+
     Returns:
-        List of search results with similarity scores and metadata
+        List of search results with similarity scores and metadata.
     """
-    # Create or use provided embedding generator
     if embedding_generator is None:
         embedding_generator = EmbeddingGenerator()
-    
-    # Generate embedding for query
+
     query_embedding = embedding_generator.generate_embedding(query_text)
-    
-    # Perform vector search
+
+    if managed_search_configured():
+        return _search_by_text_managed(
+            query_text=query_text,
+            query_embedding=query_embedding,
+            top_k=top_k,
+            source_type=source_type,
+        )
+
     results = vector_search(query_embedding, top_k=top_k, source_type=source_type)
-    
-    # Add original query to results
     for result in results:
         result['query'] = query_text
-    
     return results
+
+
+def _search_by_text_managed(
+    query_text: str,
+    query_embedding: np.ndarray,
+    top_k: int,
+    source_type: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Route retrieval through MosaicAIVectorSearchClient with a managed
+    Direct Access Index. Import is local to avoid a circular dependency:
+    the VS client's fallback path imports this module."""
+    from databricks_vector_client import MosaicAIVectorSearchClient  # noqa: E402
+
+    client = MosaicAIVectorSearchClient(columns=_MANAGED_COLUMNS)
+    filters = {"source_type": source_type} if source_type else None
+
+    # managed_search_configured() guarantees the client cannot be in
+    # fallback mode here (all 4 env vars are present), so raw is always
+    # the Mosaic AI row shape needing normalization.
+    raw = client.similarity_search(
+        query_text=query_text,
+        query_vector=query_embedding.tolist(),
+        k=top_k,
+        hybrid=False,
+        filters=filters,
+    )
+    return _normalize_managed_results(raw, query_text)
 
 def enrich_search_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """

@@ -34,6 +34,8 @@ import logging
 import os
 from typing import Any, Iterable, Optional, Sequence
 
+from governance_metrics import record_fallback
+
 logger = logging.getLogger("databricks_vector_client")
 
 _REQUIRED_ENV = (
@@ -85,6 +87,7 @@ class MosaicAIVectorSearchClient:
                 ",".join(missing),
             )
             self._fallback_active = True
+            record_fallback("vs")
             return
 
         raise RuntimeError(

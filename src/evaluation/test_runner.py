@@ -3,6 +3,7 @@ import logging
 import json
 import time
 import sqlite3
+import statistics
 from datetime import datetime
 import sys
 import os
@@ -12,18 +13,50 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from evaluation.retrieval_metrics import RetrievalEvaluator
 from evaluation.answer_evaluator import AnswerEvaluator
+from evaluation.mlflow_eval import MLflowEvalTracker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('test_runner')
 
+
+def _percentile(values, q: float) -> float:
+    """Nearest-rank percentile. `values` must be non-empty, `q` in [0, 1]."""
+    if not values:
+        raise ValueError("_percentile: values must be non-empty")
+    if not 0.0 <= q <= 1.0:
+        raise ValueError("_percentile: q must be in [0, 1]")
+    sorted_values = sorted(values)
+    idx = min(len(sorted_values) - 1, int(round(q * (len(sorted_values) - 1))))
+    return float(sorted_values[idx])
+
+
+def _mlflow_opt_in() -> bool:
+    """MLflow tracking is active when either Databricks credentials are
+    available (real workspace) or ALLOW_LOCAL_FALLBACK=true (offline
+    JSON). Absent both, test_runner proceeds without MLflow logging."""
+    if os.getenv("DATABRICKS_HOST") and os.getenv("DATABRICKS_TOKEN"):
+        return True
+    return os.getenv("ALLOW_LOCAL_FALLBACK", "").strip().lower() == "true"
+
+
 class RAGTestRunner:
-    """Automated test runner for RAG system"""
-    
+    """Automated test runner for RAG system. Evaluation runs are logged
+    to MLflow when credentials or ALLOW_LOCAL_FALLBACK are set; otherwise
+    runs still save to SQLite + JSON as they always have."""
+
     def __init__(self, db_path=None, rag_system=None):
         self.db_path = db_path or config.DB_PATH
         self.rag_system = rag_system
         self.retrieval_evaluator = RetrievalEvaluator(db_path=self.db_path)
         self.answer_evaluator = AnswerEvaluator()
+        self._tracker: MLflowEvalTracker | None = (
+            MLflowEvalTracker() if _mlflow_opt_in() else None
+        )
+        if self._tracker is None:
+            logger.info(
+                "MLflow tracking disabled: neither Databricks credentials "
+                "nor ALLOW_LOCAL_FALLBACK are set. Set them to log runs."
+            )
     
     def load_test_dataset(self, dataset_id=None, dataset_name=None, file_path=None):
         """Load test dataset from database or file"""
@@ -179,15 +212,28 @@ class RAGTestRunner:
                         {qid: res['content_ids'] for qid, res in search_results.items()},
                         ground_truth
                     )
-                    
+
                     # Save metrics
                     test_results['metrics'][config_name] = metrics
-                    
+
                     # Log summary metrics
                     if 'aggregate' in metrics:
                         logger.info(f"Search type {config_name} metrics:")
                         for metric, value in metrics['aggregate'].items():
                             logger.info(f"  {metric}: {value:.4f}")
+
+                    self._log_retrieval_run_to_mlflow(
+                        run_name=config_name,
+                        params={
+                            "dataset_name": test_results['dataset_name'],
+                            "search_type": search_type,
+                            "vector_weight": v_weight,
+                            "keyword_weight": k_weight,
+                            "top_k": top_k,
+                        },
+                        search_results=search_results,
+                        metrics=metrics,
+                    )
             else:
                 # Run standard search type
                 logger.info(f"Running {search_type} search tests")
@@ -243,13 +289,24 @@ class RAGTestRunner:
                 
                 # Save metrics
                 test_results['metrics'][search_type] = metrics
-                
+
                 # Log summary metrics
                 if 'aggregate' in metrics:
                     logger.info(f"Search type {search_type} metrics:")
                     for metric, value in metrics['aggregate'].items():
                         logger.info(f"  {metric}: {value:.4f}")
-        
+
+                self._log_retrieval_run_to_mlflow(
+                    run_name=search_type,
+                    params={
+                        "dataset_name": test_results['dataset_name'],
+                        "search_type": search_type,
+                        "top_k": top_k,
+                    },
+                    search_results=search_results,
+                    metrics=metrics,
+                )
+
         # Save test results
         self._save_test_results(test_results, 'retrieval')
         
@@ -377,12 +434,82 @@ class RAGTestRunner:
         logger.info(f"Answer quality metrics:")
         for metric, value in test_results['metrics'].items():
             logger.info(f"  {metric}: {value:.4f}")
-        
+
+        self._log_answer_run_to_mlflow(
+            run_name=f"answer_{search_type}_top{top_k}",
+            params={
+                "dataset_name": test_results['dataset_name'],
+                "search_type": search_type,
+                "top_k": top_k,
+                "vector_weight": vector_weight,
+                "keyword_weight": keyword_weight,
+                "max_queries": max_queries,
+            },
+            answer_results=test_results['answer_results'],
+            metrics=test_results['metrics'],
+        )
+
         # Save test results
         self._save_test_results(test_results, 'answer_quality')
-        
+
         return test_results
-    
+
+    def _log_retrieval_run_to_mlflow(self, run_name, params, search_results, metrics):
+        """Record one retrieval configuration as an MLflow run. No-op when
+        the tracker wasn't constructed (dev runs without creds)."""
+        if self._tracker is None:
+            return
+
+        search_times = [
+            float(r.get('search_time', 0.0))
+            for r in search_results.values()
+            if 'error' not in r
+        ]
+        latency = {}
+        if search_times:
+            latency["search_latency_p50_ms"] = statistics.median(search_times) * 1000.0
+            latency["search_latency_p95_ms"] = _percentile(search_times, 0.95) * 1000.0
+
+        aggregate = (metrics.get('aggregate') or {}) if isinstance(metrics, dict) else {}
+        metric_payload = {**aggregate, **latency}
+        if not metric_payload:
+            logger.warning(
+                "MLflow retrieval run %s: no metrics to log (aggregate + "
+                "latency both empty); skipping track_run to avoid empty run.",
+                run_name,
+            )
+            return
+
+        safe_params = {k: v for k, v in params.items() if v is not None}
+        with self._tracker.track_run(run_name=run_name, params=safe_params):
+            self._tracker.log_retrieval_metrics(metric_payload)
+
+    def _log_answer_run_to_mlflow(self, run_name, params, answer_results, metrics):
+        """Record one answer-quality configuration as an MLflow run."""
+        if self._tracker is None:
+            return
+
+        latencies = [
+            float(r.get('answer_time', 0.0))
+            for r in answer_results.values()
+            if 'error' not in r
+        ]
+        latency = {}
+        if latencies:
+            latency["answer_latency_p50_ms"] = statistics.median(latencies) * 1000.0
+            latency["answer_latency_p95_ms"] = _percentile(latencies, 0.95) * 1000.0
+
+        metric_payload = {**(metrics or {}), **latency}
+        if not metric_payload:
+            logger.warning(
+                "MLflow answer run %s: no metrics to log; skipping.", run_name,
+            )
+            return
+
+        safe_params = {k: v for k, v in params.items() if v is not None}
+        with self._tracker.track_run(run_name=run_name, params=safe_params):
+            self._tracker.log_generation_metrics(metric_payload)
+
     def _save_test_results(self, results, test_type):
         """Save test results to database and file"""
         # Save to database

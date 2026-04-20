@@ -292,13 +292,17 @@ src/
 ├── github_collector.py             --- GitHub repository collection
 ├── mistral_ocr.py                  --- Mistral AI OCR wrapper
 │
-├── embeddings.py                   --- Sentence-transformers embedding generation
+├── embeddings.py                   --- Sentence-transformers embedding generation, VS upsert fan-out
 ├── generate_embeddings.py          --- Batch embedding orchestration
-├── vector_search.py                --- Pure vector similarity search
-├── hybrid_search.py                --- Hybrid vector + keyword search
+├── vector_search.py                --- Vector similarity (managed VS + local cosine dispatch)
+├── hybrid_search.py                --- Hybrid retrieval (native VS hybrid + local FTS5 fusion)
 ├── chunking.py                     --- Text chunking with overlap
 ├── context_builder.py              --- RAG context selection and formatting
 ├── llm_integration.py              --- Claude response generation
+├── llm_client.py                   --- Unified LLM call surface (Gateway-first, SDK fallback)
+├── ai_gateway_client.py            --- Mosaic AI Gateway client (external-model routes)
+├── databricks_vector_client.py     --- Mosaic AI Vector Search client (Direct Access Index)
+├── governance_metrics.py           --- Fallback-activation counter for observability
 │
 ├── concept_extractor.py            --- LLM-powered concept extraction
 ├── knowledge_graph.py              --- Graph construction, analysis, visualization
@@ -317,7 +321,8 @@ src/
 │   ├── retrieval_metrics.py        --- Precision, recall, NDCG, MRR
 │   ├── answer_evaluator.py         --- Answer quality evaluation
 │   ├── test_queries.py             --- Programmatic test generation
-│   ├── test_runner.py              --- Evaluation orchestration
+│   ├── test_runner.py              --- Evaluation orchestration (MLflow-wrapped)
+│   ├── mlflow_eval.py              --- MLflow experiment + run tracking
 │   └── dashboard.py                --- Interactive results dashboard
 │
 ├── templates/                      --- Flask HTML templates
@@ -332,56 +337,6 @@ src/
 ```
 
 </details>
-
----
-
-## Scaffold Status — Databricks / Mosaic AI Integration
-
-This repository is a working RAG demonstrator. The Databricks / Mosaic AI surface is **scaffolded with first-class clients, not yet executed against a live workspace**. The code is structurally complete and follows the 2026 SDK surface; switching to a real workspace is a matter of setting four environment variables.
-
-### What is executed today
-
-| Path | Module | Status |
-|---|---|---|
-| Local semantic retrieval (cosine over SQLite) | `src/vector_search.py` | ✅ Runnable |
-| Local hybrid retrieval (cosine + FTS5 adaptive fusion) | `src/hybrid_search.py` | ✅ Runnable |
-| Direct Anthropic SDK generation | `src/llm_integration.py` | ✅ Runnable |
-| Local evaluation harness (JSON → SQLite) | `src/evaluation/test_runner.py` | ✅ Runnable |
-
-### What is scaffolded
-
-| Path | Module | Invocation |
-|---|---|---|
-| Mosaic AI Vector Search (Direct Access Index + native hybrid) | `src/databricks_vector_client.py` | `MosaicAIVectorSearchClient().similarity_search(...)` |
-| Mosaic AI Gateway (external-model route) | `src/ai_gateway_client.py` | `MosaicAIGatewayClient().generate(...)` |
-| MLflow-tracked RAG evaluation runs | `src/evaluation/mlflow_eval.py` | `MLflowEvalTracker().track_run(...)` |
-
-### Required environment to run the Databricks path
-
-```bash
-export DATABRICKS_HOST=https://<your-workspace>.cloud.databricks.com
-export DATABRICKS_TOKEN=<PAT or service principal token>
-export DATABRICKS_VS_ENDPOINT=<serverless VS endpoint name>
-export DATABRICKS_VS_INDEX=<catalog.schema.index>   # Unity Catalog path
-export DATABRICKS_LLM_ENDPOINT=<gateway route name>
-export MLFLOW_EXPERIMENT_NAME=/Users/you/rag-evals  # optional
-```
-
-### Fallback policy (explicit, opt-in)
-
-Each scaffolded client **fails fast** if the required env vars are missing. To enable local fallback for development, set:
-
-```bash
-export ALLOW_LOCAL_FALLBACK=true
-```
-
-When the flag is set:
-- `MosaicAIGatewayClient` → direct Anthropic SDK call, **WARNING** logged
-- `MosaicAIVectorSearchClient.similarity_search` → local `vector_search.search_by_text`, **WARNING** logged
-- `MosaicAIVectorSearchClient.upsert` → no-op + **WARNING** (avoids silent state divergence)
-- `MLflowEvalTracker` → writes runs to `./mlflow_offline/run_*.json`, **WARNING** logged
-
-There is no silent degradation. Every fallback triggers a visible log line so the code path that actually ran is auditable.
 
 <div align="center">
   <img src="terminal-bottom-panel.svg" width="100%" alt="Terminal footer">

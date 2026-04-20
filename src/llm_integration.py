@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import local modules
 import config
 from context_builder import ContextBuilder
+from llm_client import create_message, gateway_configured
 
 # Configure logging
 logging.basicConfig(
@@ -100,47 +101,44 @@ class ClaudeProvider(LLMProvider):
     def generate(self, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS,
                 temperature: float = DEFAULT_TEMPERATURE, **kwargs) -> str:
         """
-        Generate text from prompt using Claude
-        
-        Args:
-            prompt: Prompt text
-            max_tokens: Maximum tokens to generate
-            temperature: Temperature for generation (0-1)
-            
-        Returns:
-            Generated text
+        Generate text from prompt. Routes through Mosaic AI Gateway when
+        DATABRICKS_LLM_ENDPOINT is configured, otherwise uses the direct
+        Anthropic SDK path. System prompt can be passed via kwargs["system"].
         """
-        # Prepare message structure
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
-        
-        # Add retry logic
+        messages = [{"role": "user", "content": prompt}]
+        system = kwargs.pop("system", None)
+        if kwargs:
+            # Any remaining kwargs aren't portable across gateway + direct.
+            # Fail fast rather than silently dropping caller intent.
+            raise TypeError(
+                f"ClaudeProvider.generate: unsupported kwargs {list(kwargs)}; "
+                f"only 'system' is accepted beyond prompt/max_tokens/temperature."
+            )
+
         for attempt in range(self.max_retries):
             try:
-                # Debug the model name
-                logger.info(f"Using model: {self.model}")
-                
-                response = self.client.messages.create(
-                    model=self.model,
+                logger.info(
+                    "Generating via %s (model=%s)",
+                    "gateway" if gateway_configured() else "direct-anthropic",
+                    self.model,
+                )
+                return create_message(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    **kwargs
+                    system=system,
+                    model=self.model,
                 )
-                
-                # Return the content
-                return response.content[0].text
-                
             except Exception as e:
-                logger.error(f"Error generating response from Claude (attempt {attempt+1}/{self.max_retries}): {str(e)}")
+                logger.error(
+                    "Error generating response (attempt %d/%d): %s",
+                    attempt + 1, self.max_retries, e,
+                )
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay)
                 else:
                     raise
-        
-        # This should never be reached due to the raise in the loop
-        return "Error generating response."
+        raise RuntimeError("ClaudeProvider.generate: retries exhausted without raise")
         
     def generate_streaming(self, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS,
                           temperature: float = DEFAULT_TEMPERATURE, 
@@ -156,11 +154,21 @@ class ClaudeProvider(LLMProvider):
         Yields:
             Chunks of generated text
         """
-        # Prepare message structure
+        # Streaming uses the Anthropic SDK directly. Mosaic AI Gateway's
+        # predict(...) is single-shot; predict_stream is not implemented in
+        # the scaffold. Governed deployments should disable streaming or
+        # extend the Gateway client. See README Scaffold Status.
+        if gateway_configured():
+            logger.warning(
+                "ClaudeProvider.generate_streaming: DATABRICKS_LLM_ENDPOINT "
+                "is set but streaming bypasses the Gateway. This call is "
+                "NOT governed by the route's rate limits or content policy."
+            )
+
         messages = [
             {"role": "user", "content": prompt}
         ]
-        
+
         # Add retry logic for streaming
         for attempt in range(self.max_retries):
             try:

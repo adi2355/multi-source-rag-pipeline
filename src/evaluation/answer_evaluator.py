@@ -8,25 +8,17 @@ import os
 # Add parent directory to path to allow imports from main package
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
+from llm_client import create_message
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('answer_evaluator')
 
+
 class AnswerEvaluator:
-    """Evaluator for LLM answer quality using Claude"""
-    
+    """Evaluator for LLM answer quality. Routes through Mosaic AI Gateway
+    when DATABRICKS_LLM_ENDPOINT is set, otherwise direct Anthropic SDK."""
+
     def __init__(self, model=None):
-        """Initialize evaluator with Claude API client"""
-        if anthropic is None:
-            logger.warning("anthropic package not found. Please install it with pip install anthropic")
-            self.client = None
-        else:
-            self.client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
         self.model = model or "claude-3-sonnet-20240229"
     
     def evaluate_faithfulness(self, answer, context, query=None):
@@ -46,14 +38,7 @@ class AnswerEvaluator:
                 'score': 0,
                 'explanation': "Missing answer or context for evaluation"
             }
-            
-        if self.client is None:
-            logger.error("Claude API client not initialized")
-            return {
-                'score': 0,
-                'explanation': "Claude API client not initialized"
-            }
-            
+
         # Create evaluation prompt
         prompt = f"""
         You are an expert evaluator assessing the quality of AI assistant responses.
@@ -91,37 +76,30 @@ class AnswerEvaluator:
         """
         
         try:
-            # Call Claude API
-            response = self.client.messages.create(
-                model=self.model,
+            response_text = create_message(
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=1000,
                 temperature=0,
                 system="You are an expert evaluator assessing AI-generated answers. Return only valid JSON.",
-                messages=[{"role": "user", "content": prompt}]
+                model=self.model,
             )
-            
-            # Extract JSON from response
-            response_text = response.content[0].text
-            
+
             try:
-                # Try to find JSON in response
                 json_start = response_text.find('{')
                 json_end = response_text.rfind('}') + 1
-                
+
                 if json_start != -1 and json_end > json_start:
                     json_str = response_text[json_start:json_end]
                     result = json.loads(json_str)
-                    
-                    # Validate structure
+
                     if not isinstance(result, dict) or "score" not in result:
                         return {
                             'score': 0,
                             'explanation': "Invalid evaluation format"
                         }
-                    
+
                     return result
                 else:
-                    # Fallback if no JSON found
                     return {
                         'score': 0,
                         'explanation': "Could not parse evaluation result"
@@ -131,14 +109,14 @@ class AnswerEvaluator:
                     'score': 0,
                     'explanation': "Error parsing evaluation result"
                 }
-                
+
         except Exception as e:
             logger.error(f"Error evaluating answer faithfulness: {str(e)}")
             return {
                 'score': 0,
                 'explanation': f"Evaluation error: {str(e)}"
             }
-    
+
     def evaluate_relevance(self, answer, query):
         """
         Evaluate if the answer is relevant to the query
@@ -155,14 +133,7 @@ class AnswerEvaluator:
                 'score': 0,
                 'explanation': "Missing answer or query for evaluation"
             }
-            
-        if self.client is None:
-            logger.error("Claude API client not initialized")
-            return {
-                'score': 0,
-                'explanation': "Claude API client not initialized"
-            }
-            
+
         # Create evaluation prompt
         prompt = f"""
         You are an expert evaluator assessing the quality of AI assistant responses.
@@ -198,17 +169,13 @@ class AnswerEvaluator:
         """
         
         try:
-            # Call Claude API
-            response = self.client.messages.create(
-                model=self.model,
+            response_text = create_message(
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=1000,
                 temperature=0,
                 system="You are an expert evaluator assessing AI-generated answers. Return only valid JSON.",
-                messages=[{"role": "user", "content": prompt}]
+                model=self.model,
             )
-            
-            # Extract JSON from response
-            response_text = response.content[0].text
             
             try:
                 # Try to find JSON in response

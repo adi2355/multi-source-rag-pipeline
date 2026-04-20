@@ -11,8 +11,8 @@ import time
 import logging
 import sqlite3
 from datetime import datetime
-import anthropic
 import config
+from llm_client import create_message
 
 # Configure logging
 log_dir = os.path.join(config.DATA_DIR, 'logs')
@@ -27,9 +27,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('concept_extractor')
-
-# Set up the Anthropic Claude client
-client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
 def extract_concepts_from_text(text, content_type, title="", context=""):
     """
@@ -101,19 +98,14 @@ def extract_concepts_from_text(text, content_type, title="", context=""):
     """
     
     try:
-        # Call Claude API
-        message = client.messages.create(
-            model="claude-3-haiku-20240307",
+        # Routes through Mosaic AI Gateway when DATABRICKS_LLM_ENDPOINT is set.
+        response_text = create_message(
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=4000,
             temperature=0,
             system="You are an AI expert who specializes in extracting and organizing AI/ML concepts from technical content.",
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
+            model="claude-3-haiku-20240307",
         )
-        
-        # Extract JSON from response
-        response_text = message.content[0].text
         
         # Try to parse the JSON
         try:
