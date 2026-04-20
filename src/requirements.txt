@@ -107,3 +107,9 @@ pandas>=2.0.2
 pypdf2>=3.0.1
 python-levenshtein>=0.21.1
 tiktoken>=0.4.0
+
+# Databricks / Mosaic AI integration (scaffold — opt-in, requires workspace credentials)
+# See README "Scaffold Status" section. Modules fail fast without env vars unless ALLOW_LOCAL_FALLBACK=true.
+databricks-sdk>=0.40
+databricks-vectorsearch>=0.50
+mlflow>=3.0
