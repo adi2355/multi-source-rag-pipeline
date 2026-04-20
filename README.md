@@ -335,6 +335,54 @@ src/
 
 ---
 
+## Scaffold Status — Databricks / Mosaic AI Integration
+
+This repository is a working RAG demonstrator. The Databricks / Mosaic AI surface is **scaffolded with first-class clients, not yet executed against a live workspace**. The code is structurally complete and follows the 2026 SDK surface; switching to a real workspace is a matter of setting four environment variables.
+
+### What is executed today
+
+| Path | Module | Status |
+|---|---|---|
+| Local semantic retrieval (cosine over SQLite) | `src/vector_search.py` | ✅ Runnable |
+| Local hybrid retrieval (cosine + FTS5 adaptive fusion) | `src/hybrid_search.py` | ✅ Runnable |
+| Direct Anthropic SDK generation | `src/llm_integration.py` | ✅ Runnable |
+| Local evaluation harness (JSON → SQLite) | `src/evaluation/test_runner.py` | ✅ Runnable |
+
+### What is scaffolded
+
+| Path | Module | Invocation |
+|---|---|---|
+| Mosaic AI Vector Search (Direct Access Index + native hybrid) | `src/databricks_vector_client.py` | `MosaicAIVectorSearchClient().similarity_search(...)` |
+| Mosaic AI Gateway (external-model route) | `src/ai_gateway_client.py` | `MosaicAIGatewayClient().generate(...)` |
+| MLflow-tracked RAG evaluation runs | `src/evaluation/mlflow_eval.py` | `MLflowEvalTracker().track_run(...)` |
+
+### Required environment to run the Databricks path
+
+```bash
+export DATABRICKS_HOST=https://<your-workspace>.cloud.databricks.com
+export DATABRICKS_TOKEN=<PAT or service principal token>
+export DATABRICKS_VS_ENDPOINT=<serverless VS endpoint name>
+export DATABRICKS_VS_INDEX=<catalog.schema.index>   # Unity Catalog path
+export DATABRICKS_LLM_ENDPOINT=<gateway route name>
+export MLFLOW_EXPERIMENT_NAME=/Users/you/rag-evals  # optional
+```
+
+### Fallback policy (explicit, opt-in)
+
+Each scaffolded client **fails fast** if the required env vars are missing. To enable local fallback for development, set:
+
+```bash
+export ALLOW_LOCAL_FALLBACK=true
+```
+
+When the flag is set:
+- `MosaicAIGatewayClient` → direct Anthropic SDK call, **WARNING** logged
+- `MosaicAIVectorSearchClient.similarity_search` → local `vector_search.search_by_text`, **WARNING** logged
+- `MosaicAIVectorSearchClient.upsert` → no-op + **WARNING** (avoids silent state divergence)
+- `MLflowEvalTracker` → writes runs to `./mlflow_offline/run_*.json`, **WARNING** logged
+
+There is no silent degradation. Every fallback triggers a visible log line so the code path that actually ran is auditable.
+
 <div align="center">
   <img src="terminal-bottom-panel.svg" width="100%" alt="Terminal footer">
 </div>
