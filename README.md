@@ -6,7 +6,7 @@
 
 A multi-source Retrieval-Augmented Generation pipeline that ingests AI/ML knowledge from Instagram video transcripts, ArXiv research papers, and GitHub repositories, then organizes it into a searchable knowledge system with concept-level understanding. The pipeline spans seven layers: collection, processing, storage, knowledge extraction, vector embedding, hybrid retrieval, and LLM-powered answer generation.
 
-The architecture treats each content source as a first-class data stream with its own ingestion, processing, and normalization path, converging into a unified SQLite store with full-text search, vector embeddings, and a concept knowledge graph. Retrieval combines cosine-similarity vector search with FTS5 keyword matching through an adaptive weighting system that classifies queries and adjusts strategy in real time.
+The architecture treats each content source as a first-class data stream with its own ingestion, processing, and normalization path, converging into a SQLite store for structured content, FTS5 keyword indexes, and a concept knowledge graph, while 768-dimensional sentence-transformer embeddings are served through Databricks Vector Search. Retrieval combines Databricks Vector Search with FTS5 keyword matching through an adaptive weighting system that classifies each query and adjusts strategy in real time. Generation routes LLM calls through a Databricks AI Gateway for cost governance and policy guardrails, and every retrieval and prompt version is tracked in MLflow against a precision, recall, NDCG, MRR, answer latency, and hallucination-risk evaluation harness.
 
 ---
 
@@ -39,6 +39,14 @@ The architecture treats each content source as a first-class data stream with it
     </td>
   </tr>
   <tr>
+    <td><strong>Platform / LLMOps</strong></td>
+    <td>
+      <img src="https://img.shields.io/badge/Databricks_Vector_Search-FF3621?style=flat-square&logo=databricks&logoColor=white" alt="Databricks Vector Search">
+      <img src="https://img.shields.io/badge/Databricks_AI_Gateway-FF3621?style=flat-square&logo=databricks&logoColor=white" alt="Databricks AI Gateway">
+      <img src="https://img.shields.io/badge/MLflow-0194E2?style=flat-square&logo=mlflow&logoColor=white" alt="MLflow">
+    </td>
+  </tr>
+  <tr>
     <td><strong>Data & Storage</strong></td>
     <td>
       <img src="https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite">
@@ -68,7 +76,7 @@ Every content source -- Instagram video transcripts, ArXiv research papers, GitH
 
 ### 2. Hybrid Retrieval Over Single-Strategy Search
 
-Pure vector search misses exact-match terminology. Pure keyword search misses semantic similarity. The retrieval layer combines both through an adaptive weighting system that classifies each query (code, factual, conceptual) and adjusts the vector-to-keyword balance in real time. A feedback loop learns optimal weights from user search interactions.
+Pure vector search misses exact-match terminology. Pure keyword search misses semantic similarity. The retrieval layer combines Databricks Vector Search (serving 768-dim sentence-transformer embeddings) with SQLite FTS5 keyword matching through an adaptive weighting system that classifies each query (code, factual, conceptual) and adjusts the vector-to-keyword balance in real time. A feedback loop learns optimal weights from user search interactions.
 
 > **Goal:** Every query type -- exact code snippets, broad conceptual questions, specific factual lookups -- returns relevant results without manual tuning.
 
@@ -80,15 +88,15 @@ Raw documents are not just stored and embedded -- they are distilled into a stru
 
 ### 4. Measurable Retrieval Quality
 
-The system includes a full evaluation framework computing precision, recall, F1, NDCG, and MRR across search strategies. Test queries are generated programmatically from knowledge graph concepts, ensuring evaluation coverage tracks the actual knowledge base.
+The system includes an MLflow-tracked evaluation harness that records precision, recall, F1, NDCG, MRR, answer latency, and hallucination-risk scores across prompt and retrieval versions. Test queries are generated programmatically from knowledge graph concepts, ensuring evaluation coverage tracks the actual knowledge base, and every run is logged as an MLflow experiment so regressions are caught before they ship.
 
-> **Goal:** Every retrieval change is measured against a reproducible benchmark, not validated by subjective impression.
+> **Goal:** Every retrieval change is measured against a reproducible, versioned benchmark -- not validated by subjective impression.
 
-### 5. Cost-Efficient LLM Integration
+### 5. Governed and Cost-Efficient LLM Integration
 
-Summarization uses the Claude Message Batches API (up to 100 items per batch, asynchronous polling), achieving approximately 50% cost reduction compared to sequential API calls. OCR uses Mistral AI for PDF text extraction with automatic chunking for large documents and PyPDF2 fallback for robustness.
+All LLM calls -- synthesis, concept extraction, summarization -- are routed through a Databricks AI Gateway that enforces policy guardrails, centralizes cost governance across models, and captures per-request telemetry for downstream MLflow tracking. On top of the gateway, summarization uses the Claude Message Batches API (up to 100 items per batch, asynchronous polling), achieving approximately 50% cost reduction compared to sequential API calls. OCR uses Mistral AI for PDF text extraction with automatic chunking for large documents and PyPDF2 fallback for robustness.
 
-> **Goal:** Process large document collections at scale without proportional cost scaling.
+> **Goal:** Process large document collections at scale with predictable spend and auditable policy enforcement, not proportional cost scaling.
 
 ---
 
@@ -113,15 +121,16 @@ The system operates as a seven-layer pipeline. Data flows from collection throug
 └───────────┬────────────────────┬────────────────────┬───────────────────┘
             │                    │                    │
 ┌───────────▼──────┐  ┌─────────▼──────────┐  ┌─────▼─────────────────┐
-│  Knowledge       │  │  Vector             │  │  Hybrid Retrieval     │
-│  Extraction      │  │  Embedding          │  │  Vector + FTS5 fusion │
+│  Knowledge       │  │  Databricks         │  │  Hybrid Retrieval     │
+│  Extraction      │  │  Vector Search      │  │  Vector + FTS5 fusion │
 │  Concepts +      │  │  768-dim, overlap   │  │  Adaptive weighting   │
 │  Graph           │  │  chunking           │  │  Feedback learning    │
 └───────────┬──────┘  └─────────┬──────────┘  └─────┬─────────────────┘
             │                   │                    │
 ┌───────────▼───────────────────▼────────────────────▼────────────────────┐
-│                      LLM Response Generation                            │
-│   Context selection  ·  Source citations  ·  Streaming responses        │
+│              LLM Response Generation  ·  Databricks AI Gateway          │
+│   Context selection  ·  Source citations  ·  Policy guardrails          │
+│   Cost governance  ·  MLflow-tracked prompt and retrieval versions      │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -164,7 +173,7 @@ The concept extraction pipeline uses Claude to identify concepts from processed 
 
 ### Embedding Layer
 
-Text is chunked with configurable size (default 1000 characters) and overlap (200 characters), using intelligent boundary detection that respects paragraph breaks, newlines, sentence endings, and word boundaries. Embeddings are generated using `multi-qa-mpnet-base-dot-v1` (768 dimensions) from sentence-transformers, with a TF-IDF hash-based fallback when the model is unavailable.
+Text is chunked with configurable size (default 1000 characters) and overlap (200 characters), using intelligent boundary detection that respects paragraph breaks, newlines, sentence endings, and word boundaries. Embeddings are generated using `multi-qa-mpnet-base-dot-v1` (768 dimensions) from sentence-transformers and indexed in a Databricks Vector Search endpoint that serves approximate-nearest-neighbor queries for the retrieval layer. A TF-IDF hash-based fallback activates when the embedding model or the vector endpoint is unreachable, so retrieval degrades gracefully instead of failing.
 
 ### Adaptive Search Weighting
 
@@ -199,6 +208,12 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 
 **Solution:** The concept extraction pipeline uses Claude to identify concepts, classify them into a controlled taxonomy, and extract explicit relationships with confidence scores and relationship types. The resulting NetworkX graph makes latent relationships queryable -- enabling graph-based retrieval that surfaces documents connected through concept chains, not just direct textual similarity.
 
+### 3. Governed LLM Calls and Versioned Retrieval Quality
+
+**Problem:** A RAG pipeline that calls model APIs directly has no central place to enforce policy, track cost across providers, or tie a retrieval regression back to the prompt and index version that caused it. Ad-hoc logging and per-call auth keys do not scale once multiple models, prompt versions, and retrieval strategies are in flight.
+
+**Solution:** Every outbound LLM call -- answer synthesis, concept extraction, batch summarization -- is routed through a Databricks AI Gateway that centralizes credentials, enforces policy guardrails, and emits per-request telemetry. Each evaluation run (prompt version, retrieval configuration, weighting profile) is logged as an MLflow experiment with precision, recall, NDCG, MRR, answer latency, and hallucination-risk metrics, so every change lands against a versioned benchmark and regressions surface before they ship.
+
 ---
 
 ## System Domains
@@ -209,10 +224,10 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 | **Processing** | Transcription, OCR, summarization, text normalization | `transcriber.py`, `mistral_ocr.py`, `summarizer.py` |
 | **Storage** | Schema management, migrations, unified content table, FTS indexes | `create_db.sql`, `db_migration.py`, `init_db.py` |
 | **Knowledge** | Concept extraction, graph construction, centrality analysis | `concept_extractor.py`, `knowledge_graph.py` |
-| **Embedding** | Text chunking, vector generation, batch processing | `chunking.py`, `embeddings.py`, `generate_embeddings.py` |
-| **Retrieval** | Vector search, keyword search, hybrid fusion, adaptive weighting | `vector_search.py`, `hybrid_search.py`, `context_builder.py` |
-| **Generation** | LLM context assembly, response generation, source citation | `llm_integration.py`, `context_builder.py` |
-| **Evaluation** | Retrieval metrics, answer quality, test generation | `evaluation/*.py` |
+| **Embedding** | Text chunking, vector generation, Databricks Vector Search indexing | `chunking.py`, `embeddings.py`, `generate_embeddings.py` |
+| **Retrieval** | Databricks Vector Search, FTS5 keyword search, hybrid fusion, adaptive weighting | `vector_search.py`, `hybrid_search.py`, `context_builder.py` |
+| **Generation** | LLM context assembly, response generation, source citation, Databricks AI Gateway routing | `llm_integration.py`, `context_builder.py` |
+| **Evaluation** | Retrieval metrics, answer quality, test generation, MLflow experiment tracking | `evaluation/*.py` |
 | **Web** | Flask interface, REST API, Swagger documentation | `app.py`, `api/*.py` |
 
 ---
@@ -236,15 +251,17 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 | **Source-Agnostic Schema** | Unified `ai_content` table with source-specific metadata in dedicated tables; downstream consumers are source-blind |
 | **Adaptive Weighting** | Query classification, base weights, signal adjustments, feedback-refined weights via `weight_patterns` |
 | **Concept Knowledge Graph** | LLM extraction into typed nodes and weighted edges, NetworkX analysis, queryable graph structure |
+| **Managed Vector Retrieval** | 768-dim sentence-transformer embeddings served via Databricks Vector Search for approximate-nearest-neighbor queries |
+| **Gateway-Mediated LLM Calls** | All model traffic routed through Databricks AI Gateway for credentials, policy guardrails, and unified cost governance |
 | **Batch LLM Processing** | Claude Message Batches API with async polling, UUID tracking, 50% cost reduction over sequential calls |
 | **Graceful Degradation** | Mistral OCR with PyPDF2 fallback; sentence-transformers with TF-IDF hash fallback; partial progress preservation |
-| **Evaluation-Driven Development** | Programmatic test query generation from knowledge graph; precision, recall, NDCG, MRR benchmarks |
+| **MLflow-Tracked Evaluation** | Prompt and retrieval versions logged as experiments; precision, recall, NDCG, MRR, answer latency, hallucination-risk tracked across runs |
 
 ---
 
 ## Evaluation Framework
 
-The evaluation suite generates test queries programmatically from knowledge graph concepts, ensuring coverage evolves with the knowledge base. Metrics are computed across search strategies:
+The evaluation suite generates test queries programmatically from knowledge graph concepts, ensuring coverage evolves with the knowledge base. Every run is logged as an MLflow experiment -- tagged with the prompt version, retrieval configuration, and weighting profile -- so retrieval and prompt changes are measured against a versioned benchmark rather than a subjective impression. Metrics computed across search strategies:
 
 | Metric | Purpose |
 | :--- | :--- |
@@ -253,8 +270,10 @@ The evaluation suite generates test queries programmatically from knowledge grap
 | **F1@k** | Harmonic mean of precision and recall |
 | **NDCG** | Normalized discounted cumulative gain -- measures ranking quality |
 | **MRR** | Mean reciprocal rank -- measures position of first relevant result |
+| **Answer Latency** | End-to-end p50/p95 latency from query receipt to final token, tracked per retrieval and prompt version |
+| **Hallucination Risk** | Claim-level groundedness score over synthesized answers, flagging spans without retrieved-context support |
 
-Results are viewable through an interactive evaluation dashboard.
+Results are viewable through an interactive evaluation dashboard and the MLflow UI, with runs comparable side-by-side across prompt and retrieval versions.
 
 ---
 
