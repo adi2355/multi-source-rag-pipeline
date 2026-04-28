@@ -3,11 +3,12 @@ __pycache__/
 .env/
 venv/
 .DS_Store
-config.py
+/config.py
 
 # Virtual environments
 venv/
 .env/
+.venv/
 
 # Python cache
 __pycache__/
@@ -27,6 +28,14 @@ venv/
 *.sqlite3-journal
 *.sqlite3-shm
 *.sqlite3-wal
+
+# LangGraph agent checkpoint store (regenerated at runtime)
+*.sqlite
+agent_checkpoints.sqlite
+
+# pytest / coverage
+.pytest_cache/
+.coverage
 Instagram-Scraper/ responses/
 Instagram-Scraper/logs/
 Instagram-Scraper/visualizations/

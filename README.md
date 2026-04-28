@@ -193,6 +193,67 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 
 ---
 
+## Agentic Orchestration (V1)
+
+A LangGraph-based agent layer wraps the retrieval, KG, and generation primitives without replacing them. The legacy single-shot endpoint `POST /api/v1/answer` is unchanged; the agent is exposed at `POST /api/v1/agent/answer` and via the CLI `python run_agent.py`.
+
+**Topology** (compiled in `src/agent/graph.py`):
+
+```
+START → router → { fast_retrieve | kg_worker | fallback }
+                       ↓                ↓
+                  fast_retrieve ─→ kg_worker (DEEP path) ─→ grade_evidence
+                                                                ↓
+                                          { generate | fallback }
+                                                ↓
+                                          generate ─→ evaluate
+                                                          ↓
+                              { generate (regenerate) | refine | fallback | finalize }
+                                                ↓
+                                          refine ─→ { fast_retrieve | kg_worker }
+                                                ↓
+                                          finalize / fallback → END
+```
+
+**Design choices** (all enforced by tests in `tests/agent/`):
+
+- **Strict contracts.** Every LLM step returns a Pydantic v2 model (`RouteDecision`, `EvidenceGrade`, `GeneratedAnswer`, `GradeHallucination`, `GradeAnswer`, `RefinementDirective`). Schema failures raise typed `LLMSchemaError` with one bounded retry — no silent fallbacks.
+- **TypedDict graph state with reducers** (`merge_timings`, `append_trace`) so per-node timings and traces compose without losing data across loops.
+- **Three-way self-reflection edge** after `evaluate` (Cognito CRAG pattern): `not_grounded` → regenerate (bounded), `grounded ∧ not_useful` → refine (bounded), otherwise → finalize.
+- **Bounded loops.** `AGENT_MAX_REGENERATE_LOOPS` and `AGENT_MAX_REFINEMENT_LOOPS` (defaults: 1) are checked at the routing function — exceeding either path routes to `fallback` or `finalize` instead of looping forever.
+- **Honest fallback.** Empty retrieval and exhausted budgets produce a structured `insufficient_evidence: true` answer rather than a hallucinated one.
+- **SQLite checkpointer** (`langgraph-checkpoint-sqlite`) for `thread_id`-keyed conversational memory; configured via `AGENT_CHECKPOINT_DB`.
+- **Service layer** (`agent.services.agent_service.AgentService`) is the single bridge between the API/CLI and the compiled graph; HTTP handlers and CLI must not call `graph.invoke` directly.
+- **Reference architecture.** Patterns synthesized from six reference repos (cloned to `/home/adi235/CANJULY/agentic-rag-references/`); the most directly used are Cognito CRAG (router + 3-way edge) and `langgraph-orchestration` (layered service layer + node-timing reducer).
+
+**Configuration** — all `AGENT_*` env vars are read by `src/agent/config.py`:
+
+| Var | Default | Purpose |
+| :--- | :--- | :--- |
+| `AGENT_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic / Mosaic model id |
+| `AGENT_TOP_K` | 8 | Hybrid retrieval depth |
+| `AGENT_KG_TOP_K` | 5 | KG concept depth |
+| `AGENT_MAX_REFINEMENT_LOOPS` | 1 | Bounded refine loop |
+| `AGENT_MAX_REGENERATE_LOOPS` | 1 | Bounded regenerate loop |
+| `AGENT_CHECKPOINT_DB` | `./agent_checkpoints.sqlite` | SQLite path for memory |
+| `AGENT_LLM_TIMEOUT_S` | 60 | Per-call LLM timeout |
+| `AGENT_REQUIRE_EVIDENCE` | `true` | Refuse "general knowledge" answers without evidence |
+
+**Usage:**
+
+```bash
+cd src/
+python run_agent.py --query "what is GraphRAG?" --pretty
+python run_agent.py --query "compare X and Y" --thread-id chat-001 --json
+curl -X POST http://localhost:5000/api/v1/agent/answer \
+     -H 'Content-Type: application/json' \
+     -d '{"query":"what is GraphRAG?","thread_id":"chat-001"}'
+```
+
+See `docs/agent_trace_examples.md` for end-to-end trace walkthroughs.
+
+---
+
 ## Hardest Problems Solved
 
 

@@ -113,3 +113,8 @@ tiktoken>=0.4.0
 databricks-sdk>=0.40
 databricks-vectorsearch>=0.50
 mlflow>=3.0
+
+# Agentic RAG layer (V1) — LangGraph orchestration over existing primitives.
+# See src/agent/ and docs/agent_architecture.md.
+langgraph>=0.2.50
+langgraph-checkpoint-sqlite>=2.0.0

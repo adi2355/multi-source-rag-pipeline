@@ -45,6 +45,19 @@ except ImportError as e:
     print(f"Evaluation module not available: {e}")
     has_evaluation = False
 
+# Try to import the LangGraph agent blueprint (V1 agentic RAG layer).
+# Lives in `agent.blueprint` (not `src/api/`) so its import does not trigger the
+# legacy `src/api/__init__.py`. This is intentionally optional: if `langgraph` or
+# the agent package fails to import, the rest of the app stays online and the
+# legacy /api/v1/answer endpoint keeps working.
+try:
+    from agent.blueprint import agent_bp
+    app.register_blueprint(agent_bp)
+    has_agent = True
+except Exception as e:  # noqa: BLE001
+    print(f"Agent module not available: {e}")
+    has_agent = False
+
 def get_db():
     """Get database connection with row factory for easy access"""
     db = getattr(g, '_database', None)
