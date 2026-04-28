@@ -534,13 +534,19 @@ class WorkerResult(BaseModel):
 When the corpus is genuinely thin and `AGENT_ALLOW_EXTERNAL_FALLBACK=true`, the agent may invoke a **single bounded** Tavily search pass. Two triggers — **never** both on the same run:
 
 ```mermaid
-flowchart TD
-    Eval{evaluate} -->|"refine budget exhausted ∧ ¬useful ∧ flag on ∧ ¬used"| Ext[external_fallback]
-    Fb[fallback] -->|"corpus thin ∧ flag on ∧ ¬used"| Ext
-    Ext -->|"original=deep_research"| Agg[aggregate]
-    Ext -->|"empty / Tavily error"| Fin[finalize]
-    Ext -->|else| Gen[generate]
-    Ext -->|sets external_used=True FIRST| Ext
+flowchart LR
+    Eval{evaluate}
+    Fb[fallback]
+    Ext["external_fallback<br/><sub>flips external_used=true<br/>before re-entry</sub>"]
+    Agg[aggregate]
+    Gen[generate]
+    Fin[finalize]
+
+    Eval -->|"refine budget exhausted ∧ ¬useful ∧ flag on ∧ ¬used"| Ext
+    Fb -->|"corpus thin ∧ flag on ∧ ¬used"| Ext
+    Ext -->|"original = deep_research"| Agg
+    Ext -->|"else"| Gen
+    Ext -->|"empty / Tavily error"| Fin
 ```
 
 **Hard contracts** (`external_fallback.py`):
