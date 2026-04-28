@@ -417,19 +417,27 @@ After `evaluate`, the routing function `route_after_evaluate` makes a structured
 
 ```mermaid
 flowchart LR
-    E{evaluate} -->|"grounded ∧ useful"| F[finalize]
-    E -->|"¬grounded ∧ regen<budget · V1"| G[generate]
-    E -->|"¬grounded ∧ regen<budget · V2A"| A[aggregate]
-    E -->|"¬grounded ∧ regen=budget"| FB[fallback]
-    E -->|"grounded ∧ ¬useful ∧ refine<budget"| R[refine]
-    E -->|"grounded ∧ ¬useful ∧ refine=budget · V2B on ∧ ¬used"| X[external_fallback]
-    E -->|"grounded ∧ ¬useful ∧ all exhausted"| F
+    E{evaluate}
+    F[finalize]
+    G[generate]
+    A[aggregate]
+    R[refine]
+    FB[fallback]
+    X[external_fallback]
+
+    E -->|"grounded and useful"| F
+    E -->|"not grounded, regenerate budget left, V1 path"| G
+    E -->|"not grounded, regenerate budget left, deep_research"| A
+    E -->|"not grounded, regenerate budget exhausted"| FB
+    E -->|"grounded but not useful, refine budget left"| R
+    E -->|"grounded but not useful, refine budget exhausted, V2B eligible"| X
+    E -->|"all budgets exhausted"| F
     E -->|"error in state"| FB
 
-    classDef ok fill:#dcfce7,stroke:#166534
-    classDef warn fill:#fef3c7,stroke:#b45309
-    classDef bad fill:#fee2e2,stroke:#991b1b
-    classDef ext fill:#ede9fe,stroke:#5b21b6
+    classDef ok fill:#dcfce7,stroke:#166534,color:#1f2937
+    classDef warn fill:#fef3c7,stroke:#b45309,color:#1f2937
+    classDef bad fill:#fee2e2,stroke:#991b1b,color:#1f2937
+    classDef ext fill:#ede9fe,stroke:#5b21b6,color:#1f2937
     class F ok
     class G,A,R warn
     class FB bad
