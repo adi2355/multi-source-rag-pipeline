@@ -106,6 +106,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "(--pretty prints a brief per-worker summary)."
         ),
     )
+    # ---- V2C flag ----
+    p.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "Stream the agent's events live (V2C). Prints one normalized "
+            "SSE event per line (``event: name | data: {...}``) and exits "
+            "after the ``final`` event."
+        ),
+    )
     out = p.add_mutually_exclusive_group()
     out.add_argument(
         "--json",
@@ -157,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         include_workers=args.include_workers,
     )
     trace_id = str(uuid.uuid4())
+
+    # ---- V2C: streaming path ----
+    if args.stream:
+        return _run_stream(service, req, trace_id)
 
     try:
         resp = service.answer(req, trace_id=trace_id)
@@ -218,6 +232,38 @@ def main(argv: list[str] | None = None) -> int:
     # Default: just print the answer.
     print(resp.answer)
     return 0
+
+
+def _run_stream(service, req, trace_id: str) -> int:
+    """V2C streaming runner — drives ``service.astream`` and prints SSE events.
+
+    Output format is one event per *block*: ``event: <name>`` then
+    ``data: <json>`` then a blank line, matching the wire format. This makes
+    the CLI a faithful debugging mirror of the HTTP endpoint.
+    """
+    import asyncio
+    import json
+
+    async def driver() -> int:
+        try:
+            agen = service.astream(req, trace_id=trace_id)
+            async for ev in agen:
+                print(f"event: {ev['event']}")
+                print(f"data: {json.dumps(ev['data'], ensure_ascii=False)}")
+                print()
+                if ev["event"] == "final":
+                    return 0
+                if ev["event"] == "error":
+                    return 4
+            return 0
+        except AgentError as exc:
+            print(
+                f"agent_failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 3
+
+    return asyncio.run(driver())
 
 
 if __name__ == "__main__":

@@ -42,6 +42,16 @@ Env vars
 - ``AGENT_EXTERNAL_FALLBACK_TOPK`` (default ``5``) — number of Tavily hits to
   retrieve per external pass. Tagged ``provenance=EXTERNAL`` so the
   aggregator/generator prompts can mark them as a separate, lower-trust block.
+- ``AGENT_ENABLE_MLFLOW_LOGGING`` (default ``false``) — V2D opt-in flag. When
+  true, every agent run logs structured params/metrics/tags to MLflow via
+  :mod:`agent.observability.mlflow_logging`. Failures are absorbed as a
+  ``mlflow_logging`` trace step on the response (never raised), so toggling
+  this flag is safe in production.
+- ``AGENT_MLFLOW_TRACKING_URI`` (no default) — passed through to
+  ``mlflow.set_tracking_uri`` when the flag is on. When unset, MLflow uses its
+  default local ``./mlruns/`` directory.
+- ``AGENT_MLFLOW_EXPERIMENT`` (default ``agent-runs``) — MLflow experiment
+  name used by ``log_agent_run``.
 
 Sample input/output
 -------------------
@@ -115,6 +125,10 @@ class AgentSettings:
     allow_external_fallback: bool = False
     tavily_api_key: str | None = None
     external_fallback_top_k: int = 5
+    # ---- V2D additions (MLflow online logging) ----
+    enable_mlflow_logging: bool = False
+    mlflow_tracking_uri: str | None = None
+    mlflow_experiment: str = "agent-runs"
 
     @classmethod
     def from_env(cls) -> "AgentSettings":
@@ -173,6 +187,15 @@ class AgentSettings:
                 cls.external_fallback_top_k,
                 minimum=1,
             ),
+            enable_mlflow_logging=_env_bool(
+                "AGENT_ENABLE_MLFLOW_LOGGING", cls.enable_mlflow_logging
+            ),
+            mlflow_tracking_uri=(
+                (os.environ.get("AGENT_MLFLOW_TRACKING_URI") or "").strip() or None
+            ),
+            mlflow_experiment=_env_str(
+                "AGENT_MLFLOW_EXPERIMENT", cls.mlflow_experiment
+            ),
         )
 
 
@@ -198,6 +221,9 @@ if __name__ == "__main__":
         "worker_top_k",
         "allow_external_fallback",
         "external_fallback_top_k",
+        "enable_mlflow_logging",
+        "mlflow_tracking_uri",
+        "mlflow_experiment",
     ):
         print(f"  {field}: {getattr(settings, field)!r}")
     redacted = "***" if settings.tavily_api_key else None
