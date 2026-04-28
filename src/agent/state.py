@@ -32,7 +32,7 @@ Sample
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeVar
 
 from typing_extensions import TypedDict
 
@@ -42,11 +42,16 @@ from agent.schemas import (
     GradeAnswer,
     GradeHallucination,
     KGFinding,
+    OrchestrationPlan,
     RefinementDirective,
     RouteDecision,
     SourceType,
     TraceStep,
+    WorkerResult,
+    WorkerTask,
 )
+
+T = TypeVar("T")
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +84,25 @@ def append_trace(
     return out
 
 
+def add_or_reset(left: list[T] | None, right: list[T] | None) -> list[T]:
+    """List-reducer with an explicit clear sentinel.
+
+    - ``right is None``  -> reset (used by ``refine_node`` to wipe accumulated
+      worker results before the next research cycle).
+    - otherwise          -> append (parallel-safe, like ``operator.add``).
+
+    LangGraph reducer contract: ``(state_value, update_value) -> new_state_value``.
+    Per `LangGraph docs <https://langchain-ai.github.io/langgraph/concepts/low_level/#reducers>`_,
+    the signature is flexible; we use ``None`` here as a sentinel rather than a
+    typed marker class to keep the State TypedDict simple.
+    """
+    if right is None:
+        return []
+    if not left:
+        return list(right)
+    return list(left) + list(right)
+
+
 # ---------------------------------------------------------------------------
 # Graph state
 # ---------------------------------------------------------------------------
@@ -89,6 +113,17 @@ class AgentState(TypedDict, total=False):
 
     Channels are *all optional*: each node writes only the slice it owns. Reducers on
     list/dict channels make concurrent (KG worker + retrieval worker) merges safe.
+
+    V2A note on reducer choices
+    ---------------------------
+    The V1 channels ``evidence``, ``kg_findings``, ``graded_evidence`` remain
+    *last-write-wins* so :func:`agent.nodes.refine.refine_node` can still clear them
+    between regenerations. The V2 ``deep_research`` path therefore writes to dedicated
+    parallel-safe channels (``worker_results`` / ``aggregated_evidence`` /
+    ``aggregated_kg_findings``) using ``operator.add``, and the
+    :mod:`agent.nodes.aggregate` node copies the merged results back into the V1
+    channels so the rest of the pipeline (grade -> generate -> evaluate -> refine)
+    continues to work unchanged.
     """
 
     # ---- inputs / metadata -------------------------------------------------
@@ -96,17 +131,29 @@ class AgentState(TypedDict, total=False):
     thread_id: str | None
     user_query: str
     source_filter: SourceType | None
+    agent_version: str  # "v1" or "v2"
 
     # ---- routing -----------------------------------------------------------
     route: RouteDecision | None
+    original_path: str | None  # V2A: cached RoutePath.value used by route_after_refine
 
-    # ---- evidence ----------------------------------------------------------
-    # Both channels are last-write-wins so refine() can clear them between loops.
-    # (V2 will introduce parallel workers via Send and switch to operator.add.)
+    # ---- V1 evidence (last-write-wins) ------------------------------------
+    # These remain last-write-wins so refine() can clear them between loops.
     evidence: list[Evidence]
     kg_findings: list[KGFinding]
     graded_evidence: list[Evidence]
     fallback_recommended: bool
+
+    # ---- V2 deep_research orchestration -----------------------------------
+    plan: OrchestrationPlan | None
+    worker_tasks: list[WorkerTask]
+    current_task: WorkerTask | None  # set per-Send for the worker_node
+    # Parallel-safe accumulators with a None-sentinel reset (see add_or_reset). The
+    # refine_node writes None to clear them before the next research cycle.
+    worker_results: Annotated[list[WorkerResult], add_or_reset]
+    aggregated_evidence: Annotated[list[Evidence], add_or_reset]
+    aggregated_kg_findings: Annotated[list[KGFinding], add_or_reset]
+    external_used: bool  # V2B will flip this when Tavily augments evidence
 
     # ---- generation + grading ---------------------------------------------
     draft: GeneratedAnswer | None
@@ -131,6 +178,7 @@ class AgentState(TypedDict, total=False):
 
 __all__ = [
     "AgentState",
+    "add_or_reset",
     "append_trace",
     "merge_timings",
 ]
@@ -159,7 +207,31 @@ if __name__ == "__main__":
     if d != {"router": 1.0}:
         failures.append(f"merge_timings(None, x): got {d}")
 
-    total = 4
+    # V2A: AgentState parallel-safe channels exist and accept operator.add semantics
+    # (smoke check via TypedDict instantiation; runtime reducer wiring is verified by
+    # graph compilation in tests/agent/test_graph_smoke.py).
+    state: AgentState = {
+        "trace_id": "t1",
+        "user_query": "q",
+        "worker_results": [],
+        "aggregated_evidence": [],
+        "aggregated_kg_findings": [],
+    }
+    if state.get("worker_results") != []:
+        failures.append(f"worker_results init: {state.get('worker_results')!r}")
+
+    # V2A: add_or_reset reducer behaves correctly.
+    e = add_or_reset(["a"], ["b"])
+    if e != ["a", "b"]:
+        failures.append(f"add_or_reset append: {e!r}")
+    f = add_or_reset(["a"], None)
+    if f != []:
+        failures.append(f"add_or_reset reset: {f!r}")
+    g = add_or_reset(None, ["x"])
+    if g != ["x"]:
+        failures.append(f"add_or_reset(None, x): {g!r}")
+
+    total = 8
     failed = len(failures)
     if failed:
         print(f"FAIL: {failed} of {total} reducer checks failed.")

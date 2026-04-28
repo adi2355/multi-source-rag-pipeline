@@ -68,11 +68,15 @@ def route_after_evaluate(state: AgentState) -> str:
 
     Decision table:
     - error in state                  -> ``fallback``
-    - not grounded AND budget left    -> ``generate``  (regenerate same context)
+    - not grounded AND budget left    -> ``generate`` / ``aggregate``  (regenerate same context)
     - not grounded AND budget exhaust -> ``fallback``  (give up honestly)
     - grounded AND not useful AND budget left    -> ``refine``
     - grounded AND not useful AND budget exhaust -> ``finalize`` (return draft + caveat)
     - grounded AND useful             -> ``finalize``
+
+    V2A note: on the ``deep_research`` path the synthesizer is the ``aggregate`` node
+    rather than ``generate``, so a "not grounded" verdict re-runs ``aggregate`` to
+    re-synthesize from the same worker pool. We dispatch by ``state["original_path"]``.
     """
     if state.get("error"):
         return "fallback"
@@ -88,6 +92,10 @@ def route_after_evaluate(state: AgentState) -> str:
 
     if not hallucination.grounded:
         if regen_count < settings.max_regenerate_loops:
+            from agent.schemas import RoutePath  # local import to avoid cycles
+
+            if state.get("original_path") == RoutePath.DEEP_RESEARCH.value:
+                return "aggregate"
             return "generate"
         return "fallback"
 

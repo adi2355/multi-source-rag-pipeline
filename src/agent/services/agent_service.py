@@ -37,8 +37,11 @@ from agent.schemas import (
     GradeAnswer,
     GradeHallucination,
     KGFinding,
+    OrchestrationPlan,
+    RouteDecision,
     RoutePath,
     TraceStep,
+    WorkerResult,
 )
 
 logger = logging.getLogger("agent.service")
@@ -86,6 +89,7 @@ class AgentService:
             "thread_id": caller_thread_id,
             "user_query": req.query,
             "source_filter": req.source_filter,
+            "agent_version": self._settings.graph_version,
             "evidence": [],
             "kg_findings": [],
             "graded_evidence": [],
@@ -95,7 +99,19 @@ class AgentService:
             "insufficient_evidence": False,
             "node_timings_ms": {},
             "trace": [],
+            # V2A: parallel-safe channels start empty.
+            "worker_tasks": [],
+            "worker_results": [],
+            "aggregated_evidence": [],
+            "aggregated_kg_findings": [],
+            "external_used": False,
         }
+
+        # V2A: explicit mode override -> pre-populate state["route"] so the router
+        # node short-circuits the LLM call. ``"auto"`` means defer to the LLM router.
+        if req.mode != "auto":
+            initial["route"] = self._mode_to_route(req.mode)
+            initial["original_path"] = req.mode
 
         graph_config = {"configurable": {"thread_id": effective_thread_id}}
 
@@ -109,9 +125,28 @@ class AgentService:
             raise GraphCompileError(f"graph invoke failed: {exc!r}") from exc
         total_ms = (time.perf_counter() - t0) * 1000
 
-        return self._map_to_response(final, trace_id=tid, total_ms=total_ms)
+        return self._map_to_response(
+            final,
+            trace_id=tid,
+            total_ms=total_ms,
+            include_plan=req.include_plan,
+            include_workers=req.include_workers,
+        )
 
     # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _mode_to_route(mode: str) -> RouteDecision:
+        """Map an explicit ``AgentRequest.mode`` to a synthetic :class:`RouteDecision`."""
+        path_map: dict[str, RoutePath] = {
+            "fast": RoutePath.FAST,
+            "deep": RoutePath.DEEP,
+            "deep_research": RoutePath.DEEP_RESEARCH,
+            "kg_only": RoutePath.KG_ONLY,
+            "fallback": RoutePath.FALLBACK,
+        }
+        path = path_map.get(mode, RoutePath.FAST)
+        return RouteDecision(path=path, rationale=f"explicit mode override: {mode}")
 
     def _map_to_response(
         self,
@@ -119,6 +154,8 @@ class AgentService:
         *,
         trace_id: str,
         total_ms: float,
+        include_plan: bool = False,
+        include_workers: bool = False,
     ) -> AgentResponse:
         decision = final.get("route")
         route = decision.path if decision is not None else RoutePath.FALLBACK
@@ -161,6 +198,30 @@ class AgentService:
             )
         )
 
+        # ---- V2A optional fields ----
+        plan: OrchestrationPlan | None = None
+        if include_plan:
+            raw_plan = final.get("plan")
+            if isinstance(raw_plan, OrchestrationPlan):
+                plan = raw_plan
+            elif isinstance(raw_plan, dict):
+                try:
+                    plan = OrchestrationPlan.model_validate(raw_plan)
+                except Exception:  # noqa: BLE001
+                    plan = None
+
+        worker_results: list[WorkerResult] = []
+        if include_workers:
+            raw_results = final.get("worker_results") or []
+            for r in raw_results:
+                if isinstance(r, WorkerResult):
+                    worker_results.append(r)
+                elif isinstance(r, dict):
+                    try:
+                        worker_results.append(WorkerResult.model_validate(r))
+                    except Exception:  # noqa: BLE001
+                        continue
+
         response = AgentResponse(
             answer=str(final_answer or ""),
             route=route,
@@ -177,6 +238,10 @@ class AgentService:
             thread_id=final.get("thread_id"),
             insufficient_evidence=bool(final.get("insufficient_evidence")),
             error=final.get("error"),
+            agent_version=str(final.get("agent_version") or self._settings.graph_version),
+            external_used=bool(final.get("external_used")),
+            plan=plan,
+            worker_results=worker_results,
         )
         logger.info(
             "agent_request_done trace_id=%s route=%s grounded=%s answers_question=%s "

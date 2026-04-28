@@ -100,7 +100,15 @@ def answer():
             500,
         )
 
-    return jsonify(response.model_dump(mode="json")), 200
+    # V2A: ``exclude_none=True`` keeps the response payload terse for V1 callers
+    # (plan/error/grounded/answers_question stay null-only when not used). The
+    # serialization always includes the V2 ``agent_version`` field so clients can
+    # detect the new graph; ``include_plan`` / ``include_workers`` request flags
+    # control whether ``plan`` / ``worker_results`` actually carry data.
+    return (
+        jsonify(response.model_dump(mode="json", exclude_none=True)),
+        200,
+    )
 
 
 __all__ = ["agent_bp"]

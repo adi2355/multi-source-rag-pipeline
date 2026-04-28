@@ -71,29 +71,48 @@ def refine_node(state: AgentState) -> dict[str, Any]:
         ctx.update["draft"] = None
         ctx.update["hallucination"] = None
         ctx.update["answer_grade"] = None
-        # Clear evidence/KG findings/graded subset so the next pass starts clean
-        # against the refined query.
+        # Clear V1 evidence channels so the next pass starts clean against the
+        # refined query.
         ctx.update["evidence"] = []
         ctx.update["kg_findings"] = []
         ctx.update["graded_evidence"] = []
         ctx.update["fallback_recommended"] = False
+        # V2A: clear deep_research accumulators by writing the None sentinel that
+        # ``add_or_reset`` recognizes (see ``agent.state.add_or_reset``). Also
+        # clear plan/worker_tasks so the orchestrate node will re-decompose.
+        ctx.update["plan"] = None
+        ctx.update["worker_tasks"] = []
+        ctx.update["worker_results"] = None  # add_or_reset sentinel
+        ctx.update["aggregated_evidence"] = None
+        ctx.update["aggregated_kg_findings"] = None
         return ctx.partial_state
 
 
 def route_after_refine(state: AgentState) -> str:
     """After refining, re-run the workers using the refined query.
 
-    For ``kg_only`` routes, skip retrieval and go straight back to ``kg_worker``;
-    otherwise re-run ``fast_retrieve`` (which itself hands off to kg_worker on the
-    DEEP path).
+    Dispatch by the *original* router decision (cached in ``state["original_path"]``)
+    so a deep_research run goes back through ``orchestrate`` and a kg_only run skips
+    retrieval. We use ``original_path`` rather than ``state["route"].path`` because
+    the latter could be cleared/overwritten by other nodes; ``original_path`` is
+    stable for the lifetime of the run.
     """
     if state.get("error"):
         return "fallback"
     from agent.schemas import RoutePath  # local import to avoid cycles
 
+    original = state.get("original_path")
+    if original == RoutePath.DEEP_RESEARCH.value:
+        return "orchestrate"
+    if original == RoutePath.KG_ONLY.value:
+        return "kg_worker"
+
+    # Fallback: read state["route"] for runs that pre-date original_path caching.
     decision = state.get("route")
     if decision is not None and decision.path == RoutePath.KG_ONLY:
         return "kg_worker"
+    if decision is not None and decision.path == RoutePath.DEEP_RESEARCH:
+        return "orchestrate"
     return "fast_retrieve"
 
 

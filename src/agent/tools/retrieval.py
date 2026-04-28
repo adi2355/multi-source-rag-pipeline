@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-from agent.schemas import Evidence, SourceType
+from agent.schemas import Evidence, SourceType, normalize_source_type
 
 logger = logging.getLogger("agent.tools.retrieval")
 
@@ -45,17 +45,30 @@ class RetrievalResult:
     duration_ms: float = 0.0
 
 
-_VALID_SOURCES: set[str] = {"instagram", "arxiv", "github", "kg", "unknown"}
+# Canonical source-type strings the retriever may emit. Aliases like ``arxiv`` are
+# normalized via :func:`normalize_source_type` BEFORE this set is consulted, so
+# ``arxiv`` is silently mapped to ``research_paper``. ``kg`` is excluded because
+# retrieval hits never originate from the knowledge graph; the KG worker emits
+# :class:`KGFinding` instead.
+_VALID_RETRIEVAL_SOURCES: set[str] = {
+    "research_paper",
+    "github",
+    "instagram",
+    "external",
+    "unknown",
+}
 
 
 def _coerce_source(value: object) -> SourceType:
-    """Normalize the source_type field to one of the literals in :data:`SourceType`."""
-    if not isinstance(value, str):
-        return "unknown"
-    normalized = value.strip().lower()
-    if normalized in _VALID_SOURCES and normalized != "kg":
-        # ``kg`` is reserved for findings produced by the KG tool, not retrieval hits.
-        return normalized  # type: ignore[return-value]
+    """Normalize the source_type field to one of the literals in :data:`SourceType`.
+
+    Alias resolution happens here too: ``arxiv`` / ``paper`` / ``research paper``
+    all become ``research_paper`` so legacy DB rows and any new ingestion paths
+    converge on the canonical value.
+    """
+    canonical = normalize_source_type(value)
+    if canonical in _VALID_RETRIEVAL_SOURCES:
+        return canonical  # type: ignore[return-value]
     return "unknown"
 
 
@@ -114,12 +127,20 @@ def retrieve(
         )
         return RetrievalResult(status="error", error=f"import: {exc!r}", duration_ms=elapsed)
 
+    # Normalize aliases (e.g. "arxiv" -> "research_paper") so the filter we pass to
+    # the legacy primitive matches a row in the DB's ``source_types`` table.
+    canonical_filter: str | None = None
+    if source_type and source_type != "kg":
+        normalized = normalize_source_type(source_type)
+        if normalized in _VALID_RETRIEVAL_SOURCES and normalized != "unknown":
+            canonical_filter = normalized
+
     raw: list[dict]
     try:
         raw = hybrid_search(
             query=query,
             top_k=top_k,
-            source_type=source_type if source_type and source_type != "kg" else None,
+            source_type=canonical_filter,
         )
     except Exception as exc:  # noqa: BLE001
         elapsed = (time.perf_counter() - t0) * 1000
@@ -159,7 +180,8 @@ if __name__ == "__main__":
     # Self-validation: row coercion logic on synthetic rows (no DB call).
     failures: list[str] = []
 
-    good = _row_to_evidence(
+    # ARXIV alias -> research_paper canonical
+    aliased = _row_to_evidence(
         {
             "content_id": "c1",
             "chunk_index": 2,
@@ -173,8 +195,19 @@ if __name__ == "__main__":
             "search_type": "hybrid",
         }
     )
-    if good is None or good.source_type != "arxiv" or good.combined_score != 0.42:
-        failures.append(f"good row coercion: {good}")
+    if (
+        aliased is None
+        or aliased.source_type != "research_paper"
+        or aliased.combined_score != 0.42
+    ):
+        failures.append(f"alias row coercion: {aliased}")
+
+    # Legacy DB-canonical name passes through unchanged.
+    legacy = _row_to_evidence(
+        {"content_id": "c2", "chunk_text": "ok", "source_type": "research_paper"}
+    )
+    if legacy is None or legacy.source_type != "research_paper":
+        failures.append(f"legacy row coercion: {legacy}")
 
     missing_text = _row_to_evidence({"content_id": "c1", "chunk_text": ""})
     if missing_text is not None:
@@ -192,7 +225,7 @@ if __name__ == "__main__":
     if kg_source_filtered is None or kg_source_filtered.source_type != "unknown":
         failures.append(f"kg in retrieval should be unknown: {kg_source_filtered}")
 
-    total = 4
+    total = 5
     failed = len(failures)
     if failed:
         print(f"FAIL: {failed} of {total} retrieval coercion checks.")

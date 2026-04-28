@@ -105,7 +105,7 @@ def _patch_refiner(monkeypatch: pytest.MonkeyPatch, revised_query: str = "refine
     )
 
 
-def _evidence(text: str = "hello", source: str = "arxiv") -> Evidence:
+def _evidence(text: str = "hello", source: str = "research_paper") -> Evidence:
     return Evidence(content_id="c1", chunk_text=text, source_type=source)  # type: ignore[arg-type]
 
 

@@ -22,6 +22,14 @@ Env vars
 - ``AGENT_REQUIRE_EVIDENCE`` (default ``true``) — when true, the generator refuses to
   answer from "general knowledge" if zero evidence is present (the fallback node owns
   that path explicitly).
+- ``AGENT_GRAPH_VERSION`` (default ``v2``) — surfaced in ``AgentResponse.agent_version``
+  and used by the service layer to pick the V1 vs V2 graph topology. (V2A introduces
+  the ``deep_research`` path; V1 graphs continue to compile when this is set to ``v1``.)
+- ``AGENT_MAX_WORKERS`` (default ``4``) — upper bound on the number of orchestrator
+  tasks fanned out via ``Send`` for the ``deep_research`` path. Matches the safety
+  cap used by Furkan-orchestration.
+- ``AGENT_WORKER_TOP_K`` (default ``5``) — per-task ``top_k`` for worker retrieval; kept
+  small because worker outputs are aggregated, not concatenated, into the draft.
 
 Sample input/output
 -------------------
@@ -87,9 +95,18 @@ class AgentSettings:
     checkpoint_db: str = "./agent_checkpoints.sqlite"
     llm_timeout_s: int = 60
     require_evidence: bool = True
+    # ---- V2A additions ----
+    graph_version: str = "v2"
+    max_workers: int = 4
+    worker_top_k: int = 5
 
     @classmethod
     def from_env(cls) -> "AgentSettings":
+        graph_version = _env_str("AGENT_GRAPH_VERSION", cls.graph_version).lower()
+        if graph_version not in {"v1", "v2"}:
+            raise GraphCompileError(
+                f"AGENT_GRAPH_VERSION must be 'v1' or 'v2' (got: {graph_version!r})"
+            )
         return cls(
             model=_env_str("AGENT_MODEL", cls.model),
             max_refinement_loops=_env_int(
@@ -106,6 +123,11 @@ class AgentSettings:
             ),
             require_evidence=_env_bool(
                 "AGENT_REQUIRE_EVIDENCE", cls.require_evidence
+            ),
+            graph_version=graph_version,
+            max_workers=_env_int("AGENT_MAX_WORKERS", cls.max_workers, minimum=1),
+            worker_top_k=_env_int(
+                "AGENT_WORKER_TOP_K", cls.worker_top_k, minimum=1
             ),
         )
 
@@ -127,5 +149,8 @@ if __name__ == "__main__":
         "checkpoint_db",
         "llm_timeout_s",
         "require_evidence",
+        "graph_version",
+        "max_workers",
+        "worker_top_k",
     ):
         print(f"  {field}: {getattr(settings, field)!r}")

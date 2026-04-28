@@ -44,8 +44,11 @@ def test_route_decision_forbids_extra_fields() -> None:
 def test_evidence_requires_chunk_text() -> None:
     with pytest.raises(ValidationError):
         Evidence(content_id="c1", chunk_text="")
+    # ``arxiv`` is normalized to canonical ``research_paper`` at the validator boundary.
     ok = Evidence(content_id="c1", chunk_text="hello", source_type="arxiv")
-    assert ok.source_type == "arxiv"
+    assert ok.source_type == "research_paper"
+    canonical = Evidence(content_id="c2", chunk_text="hi", source_type="research_paper")
+    assert canonical.source_type == "research_paper"
 
 
 def test_kg_finding_minimal() -> None:

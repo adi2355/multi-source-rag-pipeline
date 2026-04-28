@@ -1,8 +1,8 @@
 # Agent Trace Examples
 
-Illustrative end-to-end traces for the V1 agent (`POST /api/v1/agent/answer`). Each example shows the route the agent took, the per-node trace, and the final response payload. The traces below were captured with the LLM/retrieval stubs from `tests/agent/test_graph_smoke.py`; in production, durations and rationales come from the real LLM and the SQLite/Vector Search backends.
+Illustrative end-to-end traces for the LangGraph agent (`POST /api/v1/agent/answer`). Each example shows the route the agent took, the per-node trace, and the final response payload. The traces below were captured with the LLM/retrieval stubs from `tests/agent/test_graph_smoke.py` and `tests/agent/test_graph_v2.py`; in production, durations and rationales come from the real LLM and the SQLite/Vector Search backends.
 
-For a deeper architectural overview, see the **Agentic Orchestration (V1)** section in `README.md`.
+For a deeper architectural overview, see the **Agentic Orchestration** section in `README.md` and `docs/agent_v2_architecture.md` (V2A deep_research path).
 
 ---
 
@@ -28,7 +28,7 @@ The router classifies the question as a single-source factual lookup, fast retri
 {
   "answer": "GraphRAG augments retrieval with a knowledge graph...",
   "route": "fast",
-  "evidence_used": [{"content_id": "...", "source_type": "arxiv", "...": "..."}],
+  "evidence_used": [{"content_id": "...", "source_type": "research_paper", "...": "..."}],
   "citations": [0, 1],
   "grounded": true,
   "answers_question": true,
@@ -146,11 +146,67 @@ The first draft introduces details not present in the retrieved chunks (the hall
 
 ---
 
+## 8. DEEP_RESEARCH route — orchestrator + parallel workers + aggregator (V2A)
+
+**Query:** `compare GraphRAG and HippoRAG using both papers and the github repos`
+
+The router (or its heuristic pre-filter) recognizes a multi-source comparison and dispatches to `orchestrate`. The orchestrator decomposes the question into three per-source tasks; LangGraph's `Send` primitive fans them out to the same `worker` node in parallel. Each worker retrieves with its source-specific filter, calls `worker_analyst` to produce a structured per-source analysis, and writes a `WorkerResult` to the parallel-safe `worker_results` channel. The `aggregate` node de-duplicates evidence, calls the aggregator chain to synthesize the workers' analyses, and writes the draft into the V1 channels so the existing evaluator/refiner runs unchanged.
+
+```text
+[router]            ok    14.2 ms  detail=deep_research: heuristic: comparison/multi-source cue
+[orchestrate]       ok   442.0 ms  detail=3 task(s): [paper,github,kg]
+[worker:paper]      ok   721.4 ms  detail=task_id=t1 type=paper evidence=5 kg=0 status=ok
+[worker:github]     ok   698.1 ms  detail=task_id=t2 type=github evidence=4 kg=0 status=ok
+[worker:kg]         ok    91.7 ms  detail=task_id=t3 type=kg evidence=0 kg=3 status=ok
+[aggregate]         ok   971.3 ms  detail=workers=3 evidence=8 kg=3 citations=4
+[evaluate]          ok    78.6 ms  detail=grounded=True answers_question=True
+[finalize]          ok     0.5 ms  detail=final_len=842
+[service]           ok  3018.2 ms  detail=route=deep_research
+```
+
+**Response (truncated, with `include_plan=true` and `include_workers=true`):**
+
+```json
+{
+  "answer": "GraphRAG indexes a knowledge graph alongside chunks; HippoRAG ...",
+  "route": "deep_research",
+  "agent_version": "v2",
+  "external_used": false,
+  "plan": {
+    "summary": "compare GraphRAG and HippoRAG across papers and code",
+    "decomposition_rationale": "split per source so each worker stays focused",
+    "tasks": [
+      {"task_id": "t1", "worker_type": "paper",  "query": "GraphRAG vs HippoRAG benchmarks", "...": "..."},
+      {"task_id": "t2", "worker_type": "github", "query": "GraphRAG vs HippoRAG code/usage", "...": "..."},
+      {"task_id": "t3", "worker_type": "kg",     "query": "GraphRAG concept neighbors",      "...": "..."}
+    ]
+  },
+  "worker_results": [
+    {"task_id": "t1", "worker_type": "paper",  "status": "ok", "output": {"confidence": "high",   "...": "..."}},
+    {"task_id": "t2", "worker_type": "github", "status": "ok", "output": {"confidence": "medium", "...": "..."}},
+    {"task_id": "t3", "worker_type": "kg",     "status": "ok", "output": {"confidence": "medium", "...": "..."}}
+  ],
+  "citations": [0, 2, 4, 7],
+  "grounded": true,
+  "answers_question": true,
+  "trace_id": "..."
+}
+```
+
+The `evidence_used` list is the de-duplicated union across workers, sorted by `combined_score` desc; citations index into that list.
+
+---
+
 ## How to capture your own traces
 
 ```bash
 cd src/
 AGENT_CHECKPOINT_DB=:memory: python run_agent.py --query "your question" --pretty
+
+# Force the deep_research path explicitly + show plan and per-worker outputs:
+AGENT_CHECKPOINT_DB=:memory: python run_agent.py \
+    --query "compare GraphRAG and HippoRAG using papers and github" \
+    --mode deep_research --include-plan --include-workers --pretty
 ```
 
 Or via the API:
@@ -159,5 +215,6 @@ Or via the API:
 curl -s -X POST http://localhost:5000/api/v1/agent/answer \
      -H 'Content-Type: application/json' \
      -H 'X-Request-Id: dev-001' \
-     -d '{"query":"your question"}' | jq '.trace[] | {node, status, duration_ms, detail}'
+     -d '{"query":"your question","mode":"auto"}' \
+   | jq '.trace[] | {node, status, duration_ms, detail}'
 ```

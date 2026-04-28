@@ -62,14 +62,49 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--source-filter",
-        choices=["instagram", "arxiv", "github"],
+        choices=[
+            # Canonical names + the V2A-supported "arxiv" alias for backward compat.
+            "instagram",
+            "research_paper",
+            "arxiv",
+            "github",
+        ],
         default=None,
-        help="Restrict retrieval to a single source.",
+        help=(
+            "Restrict retrieval to a single source. Aliases ('arxiv') are "
+            "normalized to canonical names by the agent."
+        ),
     )
     p.add_argument(
         "--checkpoint-db",
         default=None,
         help="Override AGENT_CHECKPOINT_DB for this run (use ':memory:' for ephemeral).",
+    )
+    # ---- V2A flags ----
+    p.add_argument(
+        "--mode",
+        choices=["auto", "fast", "deep", "deep_research", "kg_only"],
+        default="auto",
+        help=(
+            "Force a specific orchestration path (skips the LLM router). "
+            "'auto' (default) lets the LLM router decide."
+        ),
+    )
+    p.add_argument(
+        "--include-plan",
+        action="store_true",
+        help=(
+            "Surface the deep_research orchestration plan in the response "
+            "(--pretty prints it; --json includes the plan field)."
+        ),
+    )
+    p.add_argument(
+        "--include-workers",
+        action="store_true",
+        help=(
+            "Surface per-worker structured outputs in the response "
+            "(--pretty prints a brief per-worker summary)."
+        ),
     )
     out = p.add_mutually_exclusive_group()
     out.add_argument(
@@ -117,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         query=args.query,
         thread_id=args.thread_id,
         source_filter=args.source_filter,
+        mode=args.mode,
+        include_plan=args.include_plan,
+        include_workers=args.include_workers,
     )
     trace_id = str(uuid.uuid4())
 
@@ -131,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.emit_pretty:
-        print(f"Route: {resp.route.value}")
+        print(f"Route: {resp.route.value}  (agent={resp.agent_version})")
         print(f"Trace id: {resp.trace_id}")
         if resp.thread_id:
             print(f"Thread id: {resp.thread_id}")
@@ -139,6 +177,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Insufficient evidence: {resp.insufficient_evidence}")
         if resp.grounded is not None:
             print(f"Grounded: {resp.grounded}  Answers question: {resp.answers_question}")
+        if resp.external_used:
+            print("External augmentation: yes")
+
+        # V2A: optional orchestration plan summary.
+        if resp.plan is not None:
+            print()
+            print("Plan:")
+            print(f"  summary: {resp.plan.summary}")
+            if resp.plan.decomposition_rationale:
+                print(f"  rationale: {resp.plan.decomposition_rationale}")
+            for t in resp.plan.tasks:
+                src = f" source_filter={t.source_filter}" if t.source_filter else ""
+                print(f"  - {t.task_id} [{t.worker_type.value}]{src} q={t.query!r}")
+
+        # V2A: optional per-worker outputs.
+        if resp.worker_results:
+            print()
+            print("Workers:")
+            for r in resp.worker_results:
+                kp = "; ".join(r.output.key_points[:3]) or "(no key points)"
+                print(
+                    f"  - {r.task_id} [{r.worker_type.value}] status={r.status} "
+                    f"conf={r.output.confidence} kp=[{kp}]"
+                )
+
         print()
         print("Trace:")
         for step in resp.trace:

@@ -76,7 +76,7 @@ if __name__ == "__main__":
                 Evidence(
                     content_id="c1",
                     chunk_text="x",
-                    source_type="arxiv",
+                    source_type="research_paper",
                 )
             ],
             [],
@@ -87,7 +87,7 @@ if __name__ == "__main__":
                 Evidence(
                     content_id="c1",
                     chunk_text="x",
-                    source_type="arxiv",
+                    source_type="research_paper",
                 )
             ],
             [KGFinding(concept_name="X")],
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     if should_use_fallback([], []) is not True:
         failures.append("should_use_fallback empty must be True")
     if should_use_fallback(
-        [Evidence(content_id="c1", chunk_text="x", source_type="arxiv")], []
+        [Evidence(content_id="c1", chunk_text="x", source_type="research_paper")], []
     ) is not False:
         failures.append("should_use_fallback ok must be False")
 

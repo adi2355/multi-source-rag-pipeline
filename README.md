@@ -193,64 +193,83 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 
 ---
 
-## Agentic Orchestration (V1)
+## Agentic Orchestration (V2A)
 
-A LangGraph-based agent layer wraps the retrieval, KG, and generation primitives without replacing them. The legacy single-shot endpoint `POST /api/v1/answer` is unchanged; the agent is exposed at `POST /api/v1/agent/answer` and via the CLI `python run_agent.py`.
+A LangGraph-based agent layer wraps the retrieval, KG, and generation primitives without replacing them. The legacy single-shot endpoint `POST /api/v1/answer` is unchanged; the agent is exposed at `POST /api/v1/agent/answer` and via the CLI `python run_agent.py`. V2A is **strictly additive** — V1 routes (`fast`, `deep`, `kg_only`, `fallback`) are preserved; V2A adds a fifth route, `deep_research`, that decomposes complex queries into per-source workers and synthesizes the result through an aggregator.
 
 **Topology** (compiled in `src/agent/graph.py`):
 
 ```
-START → router → { fast_retrieve | kg_worker | fallback }
-                       ↓                ↓
-                  fast_retrieve ─→ kg_worker (DEEP path) ─→ grade_evidence
-                                                                ↓
-                                          { generate | fallback }
-                                                ↓
-                                          generate ─→ evaluate
-                                                          ↓
-                              { generate (regenerate) | refine | fallback | finalize }
-                                                ↓
-                                          refine ─→ { fast_retrieve | kg_worker }
-                                                ↓
-                                          finalize / fallback → END
+START → router → { fast_retrieve | kg_worker | orchestrate | fallback }
+                       │                │             │
+                       │                │             ▼
+                       ▼                │       [orchestrate] ── Send fan-out ──┐
+                  fast_retrieve ─→ kg_worker             │                       │
+                       │                                 │                       ▼
+                       ▼                          [worker]* (parallel; one per WorkerTask)
+                  grade_evidence                                               │
+                       │                                                       ▼
+                       ▼                                                  [aggregate]
+                 { generate | fallback }                                       │
+                       │                                                       │
+                       ▼                                                       │
+                  generate ──────────────────► evaluate ◄─────────────────────┘
+                                                  │
+                          ┌───────────────────────┼───────────────────────┐
+                          ▼          ▼            ▼            ▼          ▼
+                       generate   aggregate    refine       fallback   finalize
+                       (regen     (regen on
+                       V1 path)   deep_research)
+                                                  │
+                                                  ▼ (path-aware)
+                                        { fast_retrieve | kg_worker | orchestrate | fallback }
+                                                  ...
+                                              finalize / fallback → END
 ```
 
 **Design choices** (all enforced by tests in `tests/agent/`):
 
-- **Strict contracts.** Every LLM step returns a Pydantic v2 model (`RouteDecision`, `EvidenceGrade`, `GeneratedAnswer`, `GradeHallucination`, `GradeAnswer`, `RefinementDirective`). Schema failures raise typed `LLMSchemaError` with one bounded retry — no silent fallbacks.
-- **TypedDict graph state with reducers** (`merge_timings`, `append_trace`) so per-node timings and traces compose without losing data across loops.
-- **Three-way self-reflection edge** after `evaluate` (Cognito CRAG pattern): `not_grounded` → regenerate (bounded), `grounded ∧ not_useful` → refine (bounded), otherwise → finalize.
-- **Bounded loops.** `AGENT_MAX_REGENERATE_LOOPS` and `AGENT_MAX_REFINEMENT_LOOPS` (defaults: 1) are checked at the routing function — exceeding either path routes to `fallback` or `finalize` instead of looping forever.
+- **Strict contracts.** Every LLM step returns a Pydantic v2 model (`RouteDecision`, `EvidenceGrade`, `GeneratedAnswer`, `GradeHallucination`, `GradeAnswer`, `RefinementDirective`, plus V2A `OrchestrationPlan`, `WorkerStructuredOutput`, `WorkerResult`). Schema failures raise typed `LLMSchemaError` with one bounded retry — no silent fallbacks.
+- **TypedDict graph state with reducers** — V1 channels (`evidence`, `kg_findings`, `graded_evidence`) stay last-write-wins so the refine cycle can clear them; V2A's parallel-safe channels (`worker_results`, `aggregated_evidence`, `aggregated_kg_findings`) use a custom `add_or_reset` reducer that supports an explicit `None` clear sentinel.
+- **Send-based parallel fan-out.** `deep_research` runs N orchestrator-emitted tasks concurrently via LangGraph's `Send` primitive, all routed through a single `worker` node with a `WorkerType`-keyed dispatch table. One synchronous worker function — Pregel handles parallelism — keeps the graph 100% sync-compatible with V1.
+- **Three-way self-reflection edge** after `evaluate` (Cognito CRAG pattern): `not_grounded` → regenerate (bounded; `aggregate` on deep_research, `generate` elsewhere), `grounded ∧ not_useful` → refine (bounded), otherwise → finalize.
+- **Path-aware refine cycle.** `state["original_path"]` is cached at the router so post-refine routing dispatches to the right re-entry point: `deep_research` → `orchestrate` (re-decompose against the refined query), `kg_only` → `kg_worker`, else `fast_retrieve`.
+- **Source-type canonicalization (V2A.0).** The agent now uses the same `source_type` strings as the legacy DB (`research_paper`, `github`, `instagram`, ...). Aliases (`arxiv`, `paper`, ...) are normalized at every input boundary via Pydantic validators, so a `source_filter="arxiv"` request still works but actually filters the DB.
+- **Bounded loops.** `AGENT_MAX_REGENERATE_LOOPS`, `AGENT_MAX_REFINEMENT_LOOPS`, and `AGENT_MAX_WORKERS` (defaults: 1, 1, 4) are checked at the routing functions / orchestrator — exceeding any of them routes to `fallback` or `finalize` instead of looping forever.
 - **Honest fallback.** Empty retrieval and exhausted budgets produce a structured `insufficient_evidence: true` answer rather than a hallucinated one.
 - **SQLite checkpointer** (`langgraph-checkpoint-sqlite`) for `thread_id`-keyed conversational memory; configured via `AGENT_CHECKPOINT_DB`.
 - **Service layer** (`agent.services.agent_service.AgentService`) is the single bridge between the API/CLI and the compiled graph; HTTP handlers and CLI must not call `graph.invoke` directly.
-- **Reference architecture.** Patterns synthesized from six reference repos (cloned to `/home/adi235/CANJULY/agentic-rag-references/`); the most directly used are Cognito CRAG (router + 3-way edge) and `langgraph-orchestration` (layered service layer + node-timing reducer).
+- **Reference architecture.** Patterns synthesized from six reference repos (cloned to `/home/adi235/CANJULY/agentic-rag-references/`); the most directly used are Cognito CRAG (router + 3-way edge) and `langgraph-orchestration` (orchestrator + worker + aggregator + Send fan-out).
 
 **Configuration** — all `AGENT_*` env vars are read by `src/agent/config.py`:
 
 | Var | Default | Purpose |
 | :--- | :--- | :--- |
 | `AGENT_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic / Mosaic model id |
-| `AGENT_TOP_K` | 8 | Hybrid retrieval depth |
+| `AGENT_TOP_K` | 8 | Hybrid retrieval depth (V1 paths) |
 | `AGENT_KG_TOP_K` | 5 | KG concept depth |
 | `AGENT_MAX_REFINEMENT_LOOPS` | 1 | Bounded refine loop |
 | `AGENT_MAX_REGENERATE_LOOPS` | 1 | Bounded regenerate loop |
 | `AGENT_CHECKPOINT_DB` | `./agent_checkpoints.sqlite` | SQLite path for memory |
 | `AGENT_LLM_TIMEOUT_S` | 60 | Per-call LLM timeout |
 | `AGENT_REQUIRE_EVIDENCE` | `true` | Refuse "general knowledge" answers without evidence |
+| `AGENT_GRAPH_VERSION` | `v2` | Surfaced in `AgentResponse.agent_version` |
+| `AGENT_MAX_WORKERS` | 4 | Cap on Send fan-out per `deep_research` orchestration |
+| `AGENT_WORKER_TOP_K` | 5 | Per-task `top_k` for V2A worker retrieval |
 
 **Usage:**
 
 ```bash
 cd src/
 python run_agent.py --query "what is GraphRAG?" --pretty
-python run_agent.py --query "compare X and Y" --thread-id chat-001 --json
+python run_agent.py --query "compare GraphRAG and HippoRAG" \
+                    --mode deep_research --include-plan --include-workers --pretty
 curl -X POST http://localhost:5000/api/v1/agent/answer \
      -H 'Content-Type: application/json' \
-     -d '{"query":"what is GraphRAG?","thread_id":"chat-001"}'
+     -d '{"query":"compare X and Y","mode":"deep_research","include_plan":true,"include_workers":true}'
 ```
 
-See `docs/agent_trace_examples.md` for end-to-end trace walkthroughs.
+See `docs/agent_trace_examples.md` for end-to-end trace walkthroughs and `docs/agent_v2_architecture.md` for the V2A deep_research design.
 
 ---
 

@@ -53,7 +53,8 @@ def test_retrieve_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out.status == "ok"
     assert len(out.evidence) == 1
     assert isinstance(out.evidence[0], Evidence)
-    assert out.evidence[0].source_type == "arxiv"
+    # ``arxiv`` is canonicalized to ``research_paper`` by the alias normalizer.
+    assert out.evidence[0].source_type == "research_paper"
 
 
 def test_retrieve_empty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,7 +174,7 @@ def test_kg_error(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_evidence_status_paths() -> None:
     assert evidence_status([], []) == "empty"
     assert evidence_status([], [KGFinding(concept_name="x")]) == "kg_only"
-    ev = [Evidence(content_id="c1", chunk_text="x", source_type="arxiv")]
+    ev = [Evidence(content_id="c1", chunk_text="x", source_type="research_paper")]
     assert evidence_status(ev, []) == "ok"
     assert should_use_fallback([], []) is True
     assert should_use_fallback(ev, []) is False

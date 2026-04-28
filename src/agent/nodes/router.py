@@ -27,11 +27,24 @@ from agent.state import AgentState
 
 
 def router_node(state: AgentState) -> dict[str, Any]:
-    """Pick the orchestration path for this query."""
+    """Pick the orchestration path for this query.
+
+    V2A: when the user supplied an explicit ``mode`` (other than ``"auto"``) via the
+    service layer, that override is already written to ``state["route"]`` and we
+    short-circuit here without spending an LLM call. We still log a trace step so
+    the override is visible.
+    """
     trace_id = state.get("trace_id")
     query = state.get("user_query") or ""
 
     with NodeContext("router", trace_id=trace_id) as ctx:
+        # Explicit mode override: service layer pre-populated state["route"].
+        existing = state.get("route")
+        if existing is not None:
+            ctx.detail = f"{existing.path.value}: {existing.rationale} (override)"
+            ctx.update["original_path"] = existing.path.value
+            return ctx.partial_state
+
         if not query.strip():
             ctx.status = "error"
             ctx.detail = "empty user_query"
@@ -50,6 +63,9 @@ def router_node(state: AgentState) -> dict[str, Any]:
 
         ctx.detail = f"{decision.path.value}: {decision.rationale}"
         ctx.update["route"] = decision
+        # Cache the chosen path so route_after_refine can re-dispatch correctly even
+        # after refine() rewrites state["user_query"].
+        ctx.update["original_path"] = decision.path.value
         return ctx.partial_state
 
 
@@ -57,6 +73,12 @@ def route_after_router(state: AgentState) -> str:
     """Conditional edge: dispatch to worker(s) based on the router's decision.
 
     Returns the *next node name* expected by ``StateGraph.add_conditional_edges``.
+    Mapping (V2A):
+        FAST           -> "fast_retrieve"
+        DEEP           -> "fast_retrieve"  (kg_worker via static edge)
+        DEEP_RESEARCH  -> "orchestrate"   (orchestrator + Send fan-out)
+        KG_ONLY        -> "kg_worker"
+        FALLBACK       -> "fallback"
     """
     if state.get("error"):
         return "fallback"
@@ -66,7 +88,9 @@ def route_after_router(state: AgentState) -> str:
     if decision.path == RoutePath.FAST:
         return "fast_retrieve"
     if decision.path == RoutePath.DEEP:
-        return "fast_retrieve"  # fast_retrieve will hand off to kg_worker via static edge
+        return "fast_retrieve"
+    if decision.path == RoutePath.DEEP_RESEARCH:
+        return "orchestrate"
     if decision.path == RoutePath.KG_ONLY:
         return "kg_worker"
     return "fallback"
