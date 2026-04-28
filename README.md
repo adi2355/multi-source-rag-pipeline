@@ -193,9 +193,12 @@ Weights are further refined by a feedback learning loop (`search_query_log`, `se
 
 ---
 
-## Agentic Orchestration (V2A)
+## Agentic Orchestration (V2A + V2B)
 
-A LangGraph-based agent layer wraps the retrieval, KG, and generation primitives without replacing them. The legacy single-shot endpoint `POST /api/v1/answer` is unchanged; the agent is exposed at `POST /api/v1/agent/answer` and via the CLI `python run_agent.py`. V2A is **strictly additive** — V1 routes (`fast`, `deep`, `kg_only`, `fallback`) are preserved; V2A adds a fifth route, `deep_research`, that decomposes complex queries into per-source workers and synthesizes the result through an aggregator.
+A LangGraph-based agent layer wraps the retrieval, KG, and generation primitives without replacing them. The legacy single-shot endpoint `POST /api/v1/answer` is unchanged; the agent is exposed at `POST /api/v1/agent/answer` and via the CLI `python run_agent.py`. V2 is **strictly additive** and ships in two phases:
+
+- **V2A (always on)** — adds a fifth route, `deep_research`, that decomposes complex queries into per-source workers and synthesizes the result through an aggregator. V1 routes (`fast`, `deep`, `kg_only`, `fallback`) are preserved unchanged.
+- **V2B (opt-in, off by default)** — adds a Tavily-backed `external_fallback` node that the graph can invoke from two triggers: (a) after `fallback` when the corpus is thin / out-of-scope, and (b) from `route_after_evaluate` when the refinement budget is exhausted on a not-useful answer. Hard one-pass guard, explicit provenance (`provenance=external`, `source_type=external`), startup fail-fast on missing API key.
 
 **Topology** (compiled in `src/agent/graph.py`):
 
@@ -235,8 +238,9 @@ START → router → { fast_retrieve | kg_worker | orchestrate | fallback }
 - **Three-way self-reflection edge** after `evaluate` (Cognito CRAG pattern): `not_grounded` → regenerate (bounded; `aggregate` on deep_research, `generate` elsewhere), `grounded ∧ not_useful` → refine (bounded), otherwise → finalize.
 - **Path-aware refine cycle.** `state["original_path"]` is cached at the router so post-refine routing dispatches to the right re-entry point: `deep_research` → `orchestrate` (re-decompose against the refined query), `kg_only` → `kg_worker`, else `fast_retrieve`.
 - **Source-type canonicalization (V2A.0).** The agent now uses the same `source_type` strings as the legacy DB (`research_paper`, `github`, `instagram`, ...). Aliases (`arxiv`, `paper`, ...) are normalized at every input boundary via Pydantic validators, so a `source_filter="arxiv"` request still works but actually filters the DB.
+- **External fallback with explicit provenance (V2B).** When `AGENT_ALLOW_EXTERNAL_FALLBACK=true`, a single `external_fallback` node may run **once per agent turn** (hard guard via `state["external_used"]`). Every Tavily hit is tagged `provenance=Provenance.EXTERNAL` and `source_type="external"`; the aggregator and generator prompts render it in a separate `[EXTERNAL]` block so the model can apply the trust hierarchy and the response can flag external citations explicitly.
 - **Bounded loops.** `AGENT_MAX_REGENERATE_LOOPS`, `AGENT_MAX_REFINEMENT_LOOPS`, and `AGENT_MAX_WORKERS` (defaults: 1, 1, 4) are checked at the routing functions / orchestrator — exceeding any of them routes to `fallback` or `finalize` instead of looping forever.
-- **Honest fallback.** Empty retrieval and exhausted budgets produce a structured `insufficient_evidence: true` answer rather than a hallucinated one.
+- **Honest fallback.** Empty retrieval and exhausted budgets produce a structured `insufficient_evidence: true` answer rather than a hallucinated one. When V2B is enabled and Tavily also returns nothing, the user-facing message names *both* the corpus and the external retriever — no silent degradation.
 - **SQLite checkpointer** (`langgraph-checkpoint-sqlite`) for `thread_id`-keyed conversational memory; configured via `AGENT_CHECKPOINT_DB`.
 - **Service layer** (`agent.services.agent_service.AgentService`) is the single bridge between the API/CLI and the compiled graph; HTTP handlers and CLI must not call `graph.invoke` directly.
 - **Reference architecture.** Patterns synthesized from six reference repos (cloned to `/home/adi235/CANJULY/agentic-rag-references/`); the most directly used are Cognito CRAG (router + 3-way edge) and `langgraph-orchestration` (orchestrator + worker + aggregator + Send fan-out).
@@ -256,6 +260,9 @@ START → router → { fast_retrieve | kg_worker | orchestrate | fallback }
 | `AGENT_GRAPH_VERSION` | `v2` | Surfaced in `AgentResponse.agent_version` |
 | `AGENT_MAX_WORKERS` | 4 | Cap on Send fan-out per `deep_research` orchestration |
 | `AGENT_WORKER_TOP_K` | 5 | Per-task `top_k` for V2A worker retrieval |
+| `AGENT_ALLOW_EXTERNAL_FALLBACK` | `false` | V2B opt-in flag; enables the Tavily `external_fallback` node |
+| `AGENT_TAVILY_API_KEY` | (none) | Required when V2B flag is on; service fails fast at startup |
+| `AGENT_EXTERNAL_FALLBACK_TOPK` | 5 | Number of Tavily hits per V2B external pass |
 
 **Usage:**
 
@@ -264,12 +271,19 @@ cd src/
 python run_agent.py --query "what is GraphRAG?" --pretty
 python run_agent.py --query "compare GraphRAG and HippoRAG" \
                     --mode deep_research --include-plan --include-workers --pretty
+
+# Enable V2B external fallback (off by default). Service fails fast at startup
+# if the flag is on but the API key is missing — no silent degradation.
+AGENT_ALLOW_EXTERNAL_FALLBACK=true \
+AGENT_TAVILY_API_KEY="tvly-..." \
+python run_agent.py --query "what is the latest Mistral OCR pricing?" --pretty
+
 curl -X POST http://localhost:5000/api/v1/agent/answer \
      -H 'Content-Type: application/json' \
      -d '{"query":"compare X and Y","mode":"deep_research","include_plan":true,"include_workers":true}'
 ```
 
-See `docs/agent_trace_examples.md` for end-to-end trace walkthroughs and `docs/agent_v2_architecture.md` for the V2A deep_research design.
+See `docs/agent_trace_examples.md` for end-to-end trace walkthroughs (including V2B traces) and `docs/agent_v2_architecture.md` for the V2A deep_research and V2B external-fallback design.
 
 ---
 

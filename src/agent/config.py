@@ -30,6 +30,18 @@ Env vars
   cap used by Furkan-orchestration.
 - ``AGENT_WORKER_TOP_K`` (default ``5``) — per-task ``top_k`` for worker retrieval; kept
   small because worker outputs are aggregated, not concatenated, into the draft.
+- ``AGENT_ALLOW_EXTERNAL_FALLBACK`` (default ``false``) — V2B opt-in flag. When true,
+  the graph may invoke the Tavily-backed ``external_fallback`` node from two
+  triggers: (a) after :mod:`agent.nodes.fallback` when the corpus was thin, and
+  (b) from ``route_after_evaluate`` when the refinement budget is exhausted on a
+  ``not_useful`` verdict. At most one external pass per run, gated by
+  ``state["external_used"]``.
+- ``AGENT_TAVILY_API_KEY`` (no default) — Tavily Search API key. **Required** when
+  ``AGENT_ALLOW_EXTERNAL_FALLBACK=true``; the service raises
+  :class:`GraphCompileError` at startup otherwise (no silent degradation).
+- ``AGENT_EXTERNAL_FALLBACK_TOPK`` (default ``5``) — number of Tavily hits to
+  retrieve per external pass. Tagged ``provenance=EXTERNAL`` so the
+  aggregator/generator prompts can mark them as a separate, lower-trust block.
 
 Sample input/output
 -------------------
@@ -99,6 +111,10 @@ class AgentSettings:
     graph_version: str = "v2"
     max_workers: int = 4
     worker_top_k: int = 5
+    # ---- V2B additions (external fallback / Tavily) ----
+    allow_external_fallback: bool = False
+    tavily_api_key: str | None = None
+    external_fallback_top_k: int = 5
 
     @classmethod
     def from_env(cls) -> "AgentSettings":
@@ -106,6 +122,27 @@ class AgentSettings:
         if graph_version not in {"v1", "v2"}:
             raise GraphCompileError(
                 f"AGENT_GRAPH_VERSION must be 'v1' or 'v2' (got: {graph_version!r})"
+            )
+        max_workers = _env_int("AGENT_MAX_WORKERS", cls.max_workers, minimum=1)
+        if max_workers > 8:
+            raise GraphCompileError(
+                f"AGENT_MAX_WORKERS must be <= 8 (got: {max_workers})"
+            )
+        # V2B: when external fallback is enabled, the API key must be present so
+        # the service fails fast at startup instead of silently degrading at the
+        # first out-of-corpus query.
+        allow_external_fallback = _env_bool(
+            "AGENT_ALLOW_EXTERNAL_FALLBACK", cls.allow_external_fallback
+        )
+        tavily_raw = os.environ.get("AGENT_TAVILY_API_KEY")
+        tavily_api_key = (
+            tavily_raw.strip() if tavily_raw and tavily_raw.strip() else None
+        )
+        if allow_external_fallback and not tavily_api_key:
+            raise GraphCompileError(
+                "AGENT_ALLOW_EXTERNAL_FALLBACK=true but AGENT_TAVILY_API_KEY is "
+                "not set. Set the key or disable the flag — the agent refuses to "
+                "silently disable external fallback."
             )
         return cls(
             model=_env_str("AGENT_MODEL", cls.model),
@@ -125,9 +162,16 @@ class AgentSettings:
                 "AGENT_REQUIRE_EVIDENCE", cls.require_evidence
             ),
             graph_version=graph_version,
-            max_workers=_env_int("AGENT_MAX_WORKERS", cls.max_workers, minimum=1),
+            max_workers=max_workers,
             worker_top_k=_env_int(
                 "AGENT_WORKER_TOP_K", cls.worker_top_k, minimum=1
+            ),
+            allow_external_fallback=allow_external_fallback,
+            tavily_api_key=tavily_api_key,
+            external_fallback_top_k=_env_int(
+                "AGENT_EXTERNAL_FALLBACK_TOPK",
+                cls.external_fallback_top_k,
+                minimum=1,
             ),
         )
 
@@ -152,5 +196,9 @@ if __name__ == "__main__":
         "graph_version",
         "max_workers",
         "worker_top_k",
+        "allow_external_fallback",
+        "external_fallback_top_k",
     ):
         print(f"  {field}: {getattr(settings, field)!r}")
+    redacted = "***" if settings.tavily_api_key else None
+    print(f"  tavily_api_key: {redacted!r}")

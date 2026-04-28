@@ -1,9 +1,19 @@
 """
-LangGraph builder for the V2A agent topology.
+LangGraph builder for the V2A + V2B agent topology.
 
 V1 paths (preserved unchanged): fast / deep / kg_only / fallback.
 V2A path (additive):              deep_research (orchestrate -> Send fan-out ->
 worker* -> aggregate -> evaluate -> ...)
+V2B addition (opt-in, off by default): a one-pass Tavily ``external_fallback``
+node that the graph may invoke from two triggers:
+
+1. After ``fallback`` when the corpus was thin / out-of-scope.
+2. From ``route_after_evaluate`` when the refinement budget is exhausted on a
+   ``not_useful`` verdict.
+
+Both triggers are gated by :func:`agent.nodes.external_fallback.should_external_fallback`,
+which checks the operator flag, the API key presence, and a one-pass guard
+(``state["external_used"]``) so the agent can never loop the external retriever.
 
 Topology
 --------
@@ -29,21 +39,24 @@ Topology
         generate   fallback                   |
             |                                 v
             v                       conditional (3-way + budgets)
-        [evaluate]              /    |     |     |    \\
-            |               generate aggregate refine fallback finalize
-            ...                 |       (deep_research regen)
-                                v
-                            conditional --> orchestrate | fast_retrieve | kg_worker
+        [evaluate]              /    |     |     |    |    \\
+            |               generate aggregate refine fallback external_fallback finalize
+            ...                 |       (deep_research regen)         |
+                                v                                     v
+                            conditional --> orchestrate |  conditional --> aggregate | generate | finalize
+                                            fast_retrieve |              (V2B post-edge)
+                                            kg_worker     |
                                               (after refine, by original_path)
                             ...
                             [finalize] --> END
-                            [fallback]  --> END
+                            [fallback] -- conditional --> external_fallback | END (V2B)
 
 Reference
 ---------
 - ``02-cognito-crag/graph/graph.py`` for the 3-way reflection edge after generation.
 - ``06-langgraph-orchestration/app/graph/builder.py`` for the layered builder pattern.
 - LangGraph Send (parallel fan-out): https://langchain-ai.github.io/langgraph/how-tos/map-reduce/
+- Plan: ``langgraph_agentic_rag_v2_*.plan.md`` for V2B trigger semantics.
 
 Sample
 ------
@@ -62,6 +75,11 @@ from langgraph.graph import END, START, StateGraph
 from agent.errors import GraphCompileError
 from agent.nodes.aggregate import aggregate_node
 from agent.nodes.evaluate import evaluate_node, route_after_evaluate
+from agent.nodes.external_fallback import (
+    external_fallback_node,
+    route_after_external_fallback,
+    should_external_fallback,
+)
 from agent.nodes.fallback import fallback_node
 from agent.nodes.fast_retrieve import (
     fast_retrieve_node,
@@ -78,6 +96,24 @@ from agent.nodes.worker import worker_node
 from agent.state import AgentState
 
 logger = logging.getLogger("agent.graph")
+
+
+def _route_after_fallback(state: AgentState) -> str:
+    """V2B post-fallback edge.
+
+    The ``fallback_node`` always writes a structured "insufficient evidence" draft
+    and ``insufficient_evidence=True``. When the operator has enabled the V2B flag
+    and we have not yet used the external retriever, hand off to Tavily for one
+    bounded pass. Otherwise terminate the run with the structured fallback message.
+
+    The one-pass guard (``state["external_used"]``) is set inside
+    :mod:`agent.nodes.external_fallback` *before* the post-edge runs, so a
+    successful external pass that re-enters the graph and ultimately re-arrives
+    at fallback (e.g. external retrieval also failed) cannot retrigger external.
+    """
+    if should_external_fallback(state):
+        return "external_fallback"
+    return "end"
 
 
 def build_agent_graph(checkpointer: Any | None = None) -> Any:
@@ -109,6 +145,9 @@ def build_agent_graph(checkpointer: Any | None = None) -> Any:
         g.add_node("orchestrate", orchestrate_node)
         g.add_node("worker", worker_node)
         g.add_node("aggregate", aggregate_node)
+
+        # ---- V2B node (opt-in external retriever) ----
+        g.add_node("external_fallback", external_fallback_node)
 
         g.add_edge(START, "router")
 
@@ -169,6 +208,8 @@ def build_agent_graph(checkpointer: Any | None = None) -> Any:
                 "refine": "refine",
                 "fallback": "fallback",
                 "finalize": "finalize",
+                # V2B: budget exhausted on a not_useful verdict + flag on -> Tavily.
+                "external_fallback": "external_fallback",
             },
         )
 
@@ -183,7 +224,30 @@ def build_agent_graph(checkpointer: Any | None = None) -> Any:
             },
         )
 
-        g.add_edge("fallback", END)
+        # V2B: ``fallback`` no longer hard-routes to END. When external fallback is
+        # enabled and has not yet been used, hand off to ``external_fallback`` for
+        # one bounded Tavily pass; otherwise terminate the run.
+        g.add_conditional_edges(
+            "fallback",
+            _route_after_fallback,
+            {
+                "external_fallback": "external_fallback",
+                "end": END,
+            },
+        )
+
+        # V2B: post-edge for the external retriever. Path-aware re-entry — see
+        # :func:`agent.nodes.external_fallback.route_after_external_fallback`.
+        g.add_conditional_edges(
+            "external_fallback",
+            route_after_external_fallback,
+            {
+                "aggregate": "aggregate",
+                "generate": "generate",
+                "finalize": "finalize",
+            },
+        )
+
         g.add_edge("finalize", END)
 
         compiled = g.compile(checkpointer=checkpointer)

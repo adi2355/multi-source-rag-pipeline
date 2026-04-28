@@ -70,13 +70,20 @@ def route_after_evaluate(state: AgentState) -> str:
     - error in state                  -> ``fallback``
     - not grounded AND budget left    -> ``generate`` / ``aggregate``  (regenerate same context)
     - not grounded AND budget exhaust -> ``fallback``  (give up honestly)
-    - grounded AND not useful AND budget left    -> ``refine``
-    - grounded AND not useful AND budget exhaust -> ``finalize`` (return draft + caveat)
-    - grounded AND useful             -> ``finalize``
+    - grounded AND not useful AND budget left      -> ``refine``
+    - grounded AND not useful AND budget exhaust   -> ``external_fallback`` (V2B,
+      when enabled and not yet used) OR ``finalize`` (return draft + caveat)
+    - grounded AND useful                          -> ``finalize``
 
     V2A note: on the ``deep_research`` path the synthesizer is the ``aggregate`` node
     rather than ``generate``, so a "not grounded" verdict re-runs ``aggregate`` to
     re-synthesize from the same worker pool. We dispatch by ``state["original_path"]``.
+
+    V2B note: when the refinement budget is exhausted and the draft still does not
+    answer the question, we route to ``external_fallback`` (Tavily) iff
+    :func:`agent.nodes.external_fallback.should_external_fallback` returns ``True``.
+    The external pass is hard-bounded by ``state["external_used"]``, so on the
+    second visit here we fall through to ``finalize`` instead of looping.
     """
     if state.get("error"):
         return "fallback"
@@ -102,6 +109,14 @@ def route_after_evaluate(state: AgentState) -> str:
     if not answer_grade.answers_question:
         if refine_count < settings.max_refinement_loops:
             return "refine"
+        # V2B: budget exhausted and the draft still does not answer the question.
+        # If external fallback is enabled and we have not yet used it, hand off to
+        # Tavily for one bounded augmentation pass. Local import keeps the V1
+        # evaluator decoupled from the V2B node module.
+        from agent.nodes.external_fallback import should_external_fallback
+
+        if should_external_fallback(state):
+            return "external_fallback"
         return "finalize"
 
     return "finalize"

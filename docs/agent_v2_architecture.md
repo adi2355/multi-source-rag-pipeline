@@ -1,10 +1,18 @@
-# Agent V2A — Deep Research Architecture
+# Agent V2 — Deep Research + External Fallback Architecture
 
-V2A is an **additive** extension of the V1 LangGraph agent. It introduces a fifth
-route — `deep_research` — that decomposes complex questions into per-source worker
-tasks, fans them out in parallel via LangGraph's `Send` primitive, and synthesizes
-the results through an aggregator. V1 routes (`fast`, `deep`, `kg_only`,
-`fallback`) are preserved unchanged.
+V2 is an **additive** extension of the V1 LangGraph agent. It is shipped in two
+phases:
+
+- **V2A (always on)**: a fifth route — `deep_research` — that decomposes complex
+  questions into per-source worker tasks, fans them out in parallel via
+  LangGraph's `Send` primitive, and synthesizes the results through an
+  aggregator. V1 routes (`fast`, `deep`, `kg_only`, `fallback`) are preserved
+  unchanged.
+- **V2B (opt-in, off by default)**: an `external_fallback` node backed by the
+  Tavily Search API, triggerable from two places (post-corpus-fallback and
+  post-evaluator-budget-exhausted) with a hard one-pass guard. Provenance is
+  preserved end-to-end so the model and the response can distinguish corpus
+  evidence from web evidence.
 
 This document covers:
 
@@ -15,7 +23,8 @@ This document covers:
 5. [Source-type canonicalization (V2A.0)](#5-source-type-canonicalization-v2a0)
 6. [API surface](#6-api-surface)
 7. [Configuration](#7-configuration)
-8. [Reference patterns](#8-reference-patterns)
+8. [V2B external fallback](#8-v2b-external-fallback)
+9. [Reference patterns](#9-reference-patterns)
 
 ---
 
@@ -72,7 +81,14 @@ flowchart TD
     refine -->|"original_path == kg_only"| kg_worker
     refine -->|else| fast_retrieve
 
-    fallback --> Endn([END])
+    %% V2B: dual-trigger external fallback (opt-in)
+    fallback -->|"V2B: flag on AND not used"| external_fallback
+    fallback -->|"else"| Endn([END])
+    evaluate -->|"V2B: budget exhausted AND not_useful AND eligible"| external_fallback
+    external_fallback -->|"deep_research"| aggregate
+    external_fallback -->|"else"| generate
+    external_fallback -->|"empty / error"| finalize
+
     finalize --> Endn
 ```
 
@@ -84,7 +100,7 @@ flowchart TD
 | `deep`            | router -> fast_retrieve -> kg_worker -> grade_evidence -> generate -> evaluate -> finalize |
 | `kg_only`         | router -> kg_worker -> grade_evidence -> generate -> evaluate -> finalize         |
 | `deep_research`   | router -> orchestrate -> Send N workers -> aggregate -> evaluate -> finalize      |
-| `fallback`        | router -> fallback                                                                |
+| `fallback`        | router -> fallback -> [V2B: external_fallback -> generate/aggregate -> evaluate] -> finalize |
 
 The `deep_research` path **does not** run `grade_evidence` or `generate`; the
 aggregator's grounding constraint already plays the role of evidence grading and
@@ -112,7 +128,7 @@ existing refine cycle (which clears them) keeps working.
 | `aggregated_kg_findings`   | `add_or_reset`     | Parallel-safe accumulator of KG findings across workers  |
 | `original_path`            | last-write-wins    | Cached `RoutePath.value` for path-aware refine routing   |
 | `agent_version`            | last-write-wins    | "v2" for V2A graphs (surfaced in `AgentResponse`)        |
-| `external_used`            | last-write-wins    | V2B reservation (Tavily fallback indicator)              |
+| `external_used`            | last-write-wins    | V2B one-pass guard (set by `external_fallback`)          |
 
 ### `add_or_reset` semantics
 
@@ -250,13 +266,16 @@ python run_agent.py --query "compare GraphRAG and HippoRAG" \
 
 ## 7. Configuration
 
-V2A adds three env vars (read by `src/agent/config.py`):
+V2 adds six env vars (read by `src/agent/config.py`):
 
-| Env var               | Default | Purpose                                                                |
-| :-------------------- | :------ | :--------------------------------------------------------------------- |
-| `AGENT_GRAPH_VERSION` | `v2`    | Surfaced in `AgentResponse.agent_version`. Currently informational.    |
-| `AGENT_MAX_WORKERS`   | `4`     | Upper bound on Send fan-out per `deep_research` orchestration.         |
-| `AGENT_WORKER_TOP_K`  | `5`     | Per-task `top_k` for the worker retrieval primitives.                  |
+| Env var                          | Default | Purpose                                                                |
+| :------------------------------- | :------ | :--------------------------------------------------------------------- |
+| `AGENT_GRAPH_VERSION`            | `v2`    | Surfaced in `AgentResponse.agent_version`. Currently informational.    |
+| `AGENT_MAX_WORKERS`              | `4`     | Upper bound on Send fan-out per `deep_research` orchestration.         |
+| `AGENT_WORKER_TOP_K`             | `5`     | Per-task `top_k` for the worker retrieval primitives.                  |
+| `AGENT_ALLOW_EXTERNAL_FALLBACK`  | `false` | V2B opt-in flag. When true the graph may invoke `external_fallback`.   |
+| `AGENT_TAVILY_API_KEY`           | (none)  | Required when the V2B flag is on. The service fails fast at startup.   |
+| `AGENT_EXTERNAL_FALLBACK_TOPK`   | `5`     | Number of Tavily hits to retrieve per external pass.                   |
 
 V1 env vars (`AGENT_TOP_K`, `AGENT_KG_TOP_K`, `AGENT_MAX_REFINEMENT_LOOPS`,
 `AGENT_MAX_REGENERATE_LOOPS`, `AGENT_CHECKPOINT_DB`, `AGENT_REQUIRE_EVIDENCE`)
@@ -264,7 +283,97 @@ remain unchanged.
 
 ---
 
-## 8. Reference patterns
+## 8. V2B external fallback
+
+V2B introduces a single new node — `external_fallback` — that wraps the Tavily
+Search API. It is **off by default**. The agent never silently invokes external
+search; both the operator (`AGENT_ALLOW_EXTERNAL_FALLBACK=true`) and the runtime
+(`should_external_fallback(state)`) must agree before the node runs, and there
+is a hard one-pass guard so it can never run twice in a single agent turn.
+
+### 8.1 Why dual trigger?
+
+Two distinct failure shapes call for two distinct entry points:
+
+1. **Corpus thin from the start** — the router selects `fallback` (out-of-scope)
+   or `grade_evidence` drops every chunk. Without V2B the run terminates with
+   the V1 "insufficient evidence" template. With V2B the graph hands off to
+   `external_fallback` first; if Tavily returns useful evidence, the run
+   re-enters the regular synthesis path (`generate` for V1 routes,
+   `aggregate` for `deep_research`).
+2. **Budget exhausted on a not-useful answer** — the corpus had material but
+   the generated/aggregated draft does not actually address the question, and
+   the refinement loop is spent. Triggering external from `route_after_evaluate`
+   gives the agent one final attempt with a different evidence pool before
+   accepting defeat.
+
+### 8.2 Topology of the V2B layer
+
+```mermaid
+flowchart LR
+    fallback -->|"flag on AND not used"| external_fallback
+    fallback -->|"else"| END_a([END])
+    evaluate -->|"budget exhausted AND not_useful AND eligible"| external_fallback
+    external_fallback -->|"original_path == deep_research"| aggregate
+    external_fallback -->|"original_path != deep_research"| generate
+    external_fallback -->|"empty or error"| finalize
+```
+
+### 8.3 Hard contract
+
+The `external_fallback` node provides four guarantees:
+
+1. **One pass per run.** `state["external_used"]` is flipped to `True` *before*
+   any conditional re-entry, so neither the post-fallback edge nor the
+   post-evaluate edge can route to `external_fallback` a second time, even
+   across refine cycles.
+2. **Honest failure.** If the SDK is missing, the API key is missing, or
+   Tavily errors / returns nothing usable, the node sets
+   `insufficient_evidence=True` and routes to `finalize` with a synthesized
+   "neither corpus nor external returned usable evidence" draft. There is no
+   silent degradation to a corpus-only answer.
+3. **Provenance preserved.** Every `Evidence` emitted carries
+   `provenance=Provenance.EXTERNAL` and `source_type="external"`. The
+   aggregator and generator prompts render external evidence in a separate
+   `[EXTERNAL]` block and explicitly mark it as lower trust. The model is
+   instructed to flag external citations in prose ("according to the web
+   search results, ...").
+4. **Path-aware re-entry.** `route_after_external_fallback` dispatches to
+   `aggregate` for `deep_research` runs (so the existing worker pool is
+   re-synthesized over the augmented evidence union) and to `generate`
+   everywhere else (V1 single-shot answer with corpus + external evidence).
+
+### 8.4 Response shape
+
+When V2B fires, the response carries:
+
+- `external_used: true`
+- `evidence_used` includes Evidence chunks with `provenance: "external"` and
+  `source_type: "external"`. Their `url` and `title` come from Tavily, and
+  `content_id` is a deterministic `tavily:<sha1-prefix>` hash of the URL so
+  the aggregator's dedupe key (`(content_id, chunk_index)`) stays stable.
+- `trace` contains an `external_fallback` step with `status` in
+  `{ok, empty, error}` and a detail string of the form
+  `external_n=2 corpus_n=0 merged_graded_n=2`.
+
+### 8.5 Hard-fail at startup, not at runtime
+
+`AgentSettings.from_env()` raises `GraphCompileError` if the V2B flag is on
+but no key is present:
+
+```text
+AGENT_ALLOW_EXTERNAL_FALLBACK=true but AGENT_TAVILY_API_KEY is not set.
+Set the key or disable the flag — the agent refuses to silently disable
+external fallback.
+```
+
+This catches misconfiguration during process boot rather than at the first
+out-of-corpus query, where it would otherwise look like a runtime
+recovery failure.
+
+---
+
+## 9. Reference patterns
 
 | Pattern                                | Reference                                                            |
 | :------------------------------------- | :------------------------------------------------------------------- |

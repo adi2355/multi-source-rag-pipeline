@@ -23,20 +23,32 @@ Sample
 
 from __future__ import annotations
 
-from agent.schemas import Evidence, GeneratedAnswer, KGFinding, RefinementDirective
+from agent.schemas import (
+    Evidence,
+    GeneratedAnswer,
+    KGFinding,
+    Provenance,
+    RefinementDirective,
+)
 from agent.structured_llm import parse_or_raise
 
 _SYSTEM = """\
 You are a careful research assistant answering questions strictly from the supplied
-EVIDENCE chunks and (optionally) KNOWLEDGE GRAPH findings. Follow these rules:
+EVIDENCE chunks and (optionally) KNOWLEDGE GRAPH findings. Each EVIDENCE chunk is
+tagged either [CORPUS] (the user's indexed papers / GitHub / Instagram) or
+[EXTERNAL] (web search results from the V2B Tavily fallback). Follow these rules:
 
 1. Use only the supplied EVIDENCE and KG findings. Do NOT invoke outside knowledge.
 2. If the evidence is insufficient, say so plainly in `answer` and return an empty
    `citations` list. Do not bluff.
 3. Cite the supporting evidence by 0-based index (the EVIDENCE list order). The
    `citations` array must contain the indices you actually used.
-4. Keep the answer focused (<= 8 short sentences) and direct.
-5. If a REFINEMENT_DIRECTIVE is provided, take its instructions seriously while still
+4. Trust hierarchy: [CORPUS] is TRUSTED, [EXTERNAL] is LOWER TRUST. Prefer corpus
+   citations when both are available. When the answer rests on [EXTERNAL] evidence,
+   explicitly flag that in the prose (e.g. "according to the web search results,
+   ...") so the reader knows it is not from the indexed corpus.
+5. Keep the answer focused (<= 8 short sentences) and direct.
+6. If a REFINEMENT_DIRECTIVE is provided, take its instructions seriously while still
    grounding the new answer in EVIDENCE.
 
 Output schema:
@@ -51,9 +63,13 @@ def _format_evidence(evidence: list[Evidence]) -> str:
     parts: list[str] = []
     for i, ev in enumerate(evidence):
         title = ev.title or "(untitled)"
+        # V2B: tag provenance so the model can apply the trust hierarchy.
+        prov_tag = (
+            "[EXTERNAL]" if ev.provenance == Provenance.EXTERNAL else "[CORPUS]"
+        )
         parts.append(
-            f"[{i}] source={ev.source_type} title={title!r} score={ev.combined_score:.3f}\n"
-            f"    {ev.chunk_text}"
+            f"[{i}] {prov_tag} source={ev.source_type} title={title!r}"
+            f" score={ev.combined_score:.3f}\n    {ev.chunk_text}"
         )
     return "\n\n".join(parts)
 

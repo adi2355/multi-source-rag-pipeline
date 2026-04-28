@@ -118,3 +118,8 @@ mlflow>=3.0
 # See src/agent/ and docs/agent_architecture.md.
 langgraph>=0.2.50
 langgraph-checkpoint-sqlite>=2.0.0
+
+# Agentic RAG layer (V2B) — external retriever for out-of-corpus / budget-exhausted
+# fallbacks. Optional install: only required when AGENT_ALLOW_EXTERNAL_FALLBACK=true.
+# Docs: https://docs.tavily.com/sdk/python
+tavily-python>=0.5.0

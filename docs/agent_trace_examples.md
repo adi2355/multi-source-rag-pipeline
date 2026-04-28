@@ -197,6 +197,78 @@ The `evidence_used` list is the de-duplicated union across workers, sorted by `c
 
 ---
 
+## 9. V2B external fallback — out-of-corpus rescue (Tavily)
+
+**Query:** `what's the latest Mistral OCR pricing?` (corpus has no real-time pricing)
+
+`AGENT_ALLOW_EXTERNAL_FALLBACK=true` and `AGENT_TAVILY_API_KEY=tvly-...` are set. The router classifies the query as out-of-scope (no real-time data in the corpus) and dispatches to `fallback`. The post-fallback edge sees that V2B is enabled and the one-pass guard is not yet set, so it hands off to `external_fallback`. Tavily returns two relevant web pages tagged `provenance=external`; the node clears the V1 fallback draft, writes the external evidence into `graded_evidence`, and routes back into `generate`. The V1 evaluator runs unchanged.
+
+```text
+[router]              ok    13.1 ms  detail=fallback: out-of-scope (real-time data)
+[fallback]            ok     1.2 ms  detail=insufficient_evidence
+[external_fallback]   ok   612.4 ms  detail=external_n=2 corpus_n=0 merged_graded_n=2
+[generate]            ok   702.0 ms  detail=draft_len=298 citations=[0, 1] regen=0
+[evaluate]            ok    74.1 ms  detail=grounded=True answers_question=True
+[finalize]            ok     0.5 ms  detail=final_len=298
+[service]             ok  1404.0 ms  detail=route=fallback
+```
+
+**Response (truncated):**
+
+```json
+{
+  "answer": "According to the web search results, Mistral OCR is priced at ...",
+  "route": "fallback",
+  "agent_version": "v2",
+  "external_used": true,
+  "evidence_used": [
+    {
+      "content_id": "tavily:1a2b3c4d",
+      "source_type": "external",
+      "provenance": "external",
+      "url": "https://docs.mistral.ai/pricing/ocr",
+      "title": "Mistral OCR Pricing",
+      "search_type": "tavily",
+      "...": "..."
+    }
+  ],
+  "citations": [0, 1],
+  "insufficient_evidence": false,
+  "trace_id": "..."
+}
+```
+
+The model is instructed to mark external citations explicitly ("according to the web search results, ...") so downstream readers know the answer is not from the indexed corpus.
+
+---
+
+## 10. V2B external fallback — budget exhausted on the FAST path
+
+**Query:** `is the new Llama-4 model better than DeepSeek-V3 on long context?`
+
+The corpus has Llama-4 chunks but only oblique DeepSeek-V3 mentions. The first generated draft is grounded but does not actually answer the question. `refine` runs once (`AGENT_MAX_REFINEMENT_LOOPS=1`); the second draft is also not_useful. The refinement budget is now exhausted, so `route_after_evaluate` checks the V2B eligibility, finds the flag on and `external_used=False`, and hands off to `external_fallback`. Tavily returns three benchmark blog posts; the second `generate` call combines the corpus + external evidence and answers the question.
+
+```text
+[router]              ok    12.0 ms  detail=fast
+[fast_retrieve]       ok    81.0 ms  detail=4 hits
+[grade_evidence]      ok    48.0 ms  detail=kept=3 dropped=1 grader_failures=0
+[generate]            ok   601.0 ms  detail=draft_len=388 citations=[0, 1] regen=0
+[evaluate]            ok    74.0 ms  detail=grounded=True answers_question=False
+[refine]              ok   210.0 ms  detail=revised_query='Llama-4 vs DeepSeek-V3 long-context benchmarks' iter=1
+[fast_retrieve]       ok    79.0 ms  detail=5 hits
+[grade_evidence]      ok    49.0 ms  detail=kept=4 dropped=1 grader_failures=0
+[generate]            ok   620.0 ms  detail=draft_len=521 citations=[0, 2, 3]
+[evaluate]            ok    73.0 ms  detail=grounded=True answers_question=False
+[external_fallback]   ok   702.0 ms  detail=external_n=3 corpus_n=4 merged_graded_n=7
+[generate]            ok   639.0 ms  detail=draft_len=612 citations=[0, 4, 5, 6]
+[evaluate]            ok    71.0 ms  detail=grounded=True answers_question=True
+[finalize]            ok     0.5 ms  detail=final_len=612
+```
+
+`external_used: true` and `refinement_iterations: 1` together capture the recovery shape: V1 refine ran exactly once, then V2B kicked in once. The one-pass guard guarantees that even if the post-external draft were also not_useful, the graph would land at `finalize` (not loop back into `external_fallback`).
+
+---
+
 ## How to capture your own traces
 
 ```bash
@@ -207,6 +279,13 @@ AGENT_CHECKPOINT_DB=:memory: python run_agent.py --query "your question" --prett
 AGENT_CHECKPOINT_DB=:memory: python run_agent.py \
     --query "compare GraphRAG and HippoRAG using papers and github" \
     --mode deep_research --include-plan --include-workers --pretty
+
+# Enable V2B external fallback (off by default). The wrapper fails fast at
+# startup if the API key is missing.
+AGENT_CHECKPOINT_DB=:memory: \
+AGENT_ALLOW_EXTERNAL_FALLBACK=true \
+AGENT_TAVILY_API_KEY="tvly-..." \
+python run_agent.py --query "what's the latest Mistral OCR pricing?" --pretty
 ```
 
 Or via the API:

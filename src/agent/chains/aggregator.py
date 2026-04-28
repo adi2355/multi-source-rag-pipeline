@@ -37,6 +37,7 @@ from agent.schemas import (
     Evidence,
     GeneratedAnswer,
     KGFinding,
+    Provenance,
     WorkerResult,
 )
 from agent.structured_llm import parse_or_raise
@@ -47,8 +48,16 @@ You will receive:
 - QUESTION: the original user question.
 - WORKER_ANALYSES: per-source structured analyses (key_points, analysis, caveats,
   confidence) from parallel workers.
-- EVIDENCE: the unified, indexed list of retrieval chunks the workers used.
+- EVIDENCE: the unified, indexed list of retrieval chunks the workers used. Each
+  chunk is tagged either [CORPUS] (indexed papers / GitHub / Instagram) or
+  [EXTERNAL] (web search results — V2B Tavily fallback).
 - KNOWLEDGE_GRAPH: the unified KG findings, if any.
+
+Trust hierarchy: [CORPUS] is the user's curated index — TRUSTED. [EXTERNAL] is
+ad-hoc web search — LOWER TRUST. Prefer corpus citations when available; only use
+external citations when corpus is genuinely silent on the question. When you do
+cite external evidence, explicitly flag it in prose (e.g. "according to the web
+search results, ..." or "external sources suggest ...").
 
 Your job is to write ONE grounded answer that synthesizes the worker analyses. Hard
 rules:
@@ -60,6 +69,8 @@ rules:
 4. If evidence is thin, say so plainly and return an empty `citations` list. No
    bluffing. The downstream evaluator/refiner will decide what to do.
 5. Keep the answer focused (<= 10 short sentences). No Markdown headers.
+6. When the answer rests on [EXTERNAL] evidence, mark that in the prose so the
+   reader knows it is web-sourced, not corpus-sourced.
 
 Output schema:
 - answer: prose string, plain text.
@@ -92,8 +103,14 @@ def _format_evidence(evidence: list[Evidence]) -> str:
     parts: list[str] = []
     for i, ev in enumerate(evidence):
         title = ev.title or "(untitled)"
+        # V2B: surface provenance so the model can apply the trust hierarchy.
+        # Corpus chunks dominate the prompt; external chunks are clearly marked
+        # so the model can cite them only as a last resort.
+        prov_tag = (
+            "[EXTERNAL]" if ev.provenance == Provenance.EXTERNAL else "[CORPUS]"
+        )
         parts.append(
-            f"[{i}] source={ev.source_type} title={title!r}"
+            f"[{i}] {prov_tag} source={ev.source_type} title={title!r}"
             f" score={ev.combined_score:.3f}\n    {ev.chunk_text}"
         )
     return "\n\n".join(parts)
