@@ -258,29 +258,29 @@ flowchart TD
     GradeEv -->|some_relevant| Generate[generate]
     GradeEv -->|all_irrelevant| Fallback
 
-    Orchestrate -->|"Send · per WorkerTask"| Worker["worker (parallel)"]
+    Orchestrate -->|"Send per WorkerTask"| Worker["worker (parallel)"]
     Orchestrate -->|empty plan| Fallback
     Worker --> Aggregate[aggregate]
     Aggregate --> Evaluate
 
-    Generate --> Evaluate{evaluate · 3-way}
+    Generate --> Evaluate{evaluate}
 
-    Evaluate -->|grounded ∧ useful| Finalize[finalize]
-    Evaluate -->|"not_grounded · V1"| Generate
-    Evaluate -->|"not_grounded · V2A"| Aggregate
-    Evaluate -->|"grounded ∧ not_useful"| Refine[refine]
-    Evaluate -->|"V2B: budget exhausted ∧ flag on"| ExternalFallback[external_fallback]
+    Evaluate -->|"grounded and useful"| Finalize[finalize]
+    Evaluate -->|"not grounded, V1 path"| Generate
+    Evaluate -->|"not grounded, deep_research"| Aggregate
+    Evaluate -->|"grounded but not useful"| Refine[refine]
+    Evaluate -->|"budget exhausted, V2B eligible"| ExternalFallback[external_fallback]
     Evaluate -->|"all budgets exhausted"| Fallback
 
-    Refine -->|original=deep_research| Orchestrate
-    Refine -->|original=kg_only| KGWorker
+    Refine -->|"original = deep_research"| Orchestrate
+    Refine -->|"original = kg_only"| KGWorker
     Refine -->|else| FastRetrieve
 
-    Fallback -->|"V2B: flag on ∧ not_used"| ExternalFallback
+    Fallback -->|"V2B eligible"| ExternalFallback
     Fallback -->|else| EndN([END])
 
-    ExternalFallback -->|original=deep_research| Aggregate
-    ExternalFallback -->|empty / error| Finalize
+    ExternalFallback -->|"original = deep_research"| Aggregate
+    ExternalFallback -->|"empty or error"| Finalize
     ExternalFallback -->|else| Generate
 
     Finalize --> EndN
@@ -550,8 +550,8 @@ flowchart LR
     Gen[generate]
     Fin[finalize]
 
-    Eval -->|"refine budget exhausted ∧ ¬useful ∧ flag on ∧ ¬used"| Ext
-    Fb -->|"corpus thin ∧ flag on ∧ ¬used"| Ext
+    Eval -->|"refine budget exhausted, not useful, V2B eligible"| Ext
+    Fb -->|"corpus thin, V2B eligible"| Ext
     Ext -->|"original = deep_research"| Agg
     Ext -->|"else"| Gen
     Ext -->|"empty / Tavily error"| Fin
