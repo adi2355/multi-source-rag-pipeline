@@ -4,7 +4,7 @@
 
 ## Overview
 
-A multi-source Retrieval-Augmented Generation pipeline that ingests AI/ML knowledge from Instagram video transcripts, ArXiv research papers, and GitHub repositories, then organizes it into a searchable knowledge system with concept-level understanding. The pipeline spans seven layers: collection, processing, storage, knowledge extraction, vector embedding, hybrid retrieval, and LLM-powered answer generation.
+A multi-source Retrieval-Augmented Generation pipeline that ingests AI/ML knowledge from Instagram video transcripts, ArXiv research papers, and GitHub repositories, then organizes it into a searchable knowledge system with concept-level understanding. The pipeline spans seven layers: collection, processing, storage, knowledge extraction, vector embedding, hybrid retrieval,  and LLM-powered answer generation.
 
 The architecture treats each content source as a first-class data stream with its own ingestion, processing, and normalization path, converging into a SQLite store for structured content, FTS5 keyword indexes, and a concept knowledge graph, while 768-dimensional sentence-transformer embeddings are served through Databricks Vector Search. Retrieval combines Databricks Vector Search with FTS5 keyword matching through an adaptive weighting system that classifies each query and adjusts strategy in real time. Generation routes LLM calls through a Databricks AI Gateway for cost governance and policy guardrails, and every retrieval and prompt version is tracked in MLflow against a precision,, recall, NDCG, MRR, answer latency, and hallucination-risk evaluation harness.
 
