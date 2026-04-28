@@ -474,30 +474,30 @@ sequenceDiagram
     participant U as User
     participant R as router
     participant O as orchestrate
-    participant W1 as worker:paper
-    participant W2 as worker:github
-    participant W3 as worker:kg
+    participant W1 as worker_paper
+    participant W2 as worker_github
+    participant W3 as worker_kg
     participant A as aggregate
     participant E as evaluate
     participant F as finalize
 
-    U->>R: "Compare GraphRAG and HippoRAG across papers, github, and KG"
-    R->>O: route=deep_research
-    O->>O: LLM emits OrchestrationPlan(tasks=[t1:paper, t2:github, t3:kg])
-    Note over O: _ensure_tasks: synthesize GENERAL task if plan empty
-    par Send · 3 parallel workers
-        O->>W1: Send("worker", current_task=t1)
-        W1-->>A: WorkerResult{evidence, key_points, confidence}
+    U->>R: compare GraphRAG and HippoRAG across papers, github, KG
+    R->>O: route = deep_research
+    O->>O: LLM returns OrchestrationPlan with t1 paper, t2 github, t3 kg
+    Note over O: ensure_tasks fallback synthesizes a GENERAL task if plan is empty
+    par Send fan-out, 3 parallel workers
+        O->>W1: Send t1
+        W1-->>A: WorkerResult evidence + key_points
     and
-        O->>W2: Send("worker", current_task=t2)
-        W2-->>A: WorkerResult{evidence, key_points, confidence}
+        O->>W2: Send t2
+        W2-->>A: WorkerResult evidence + key_points
     and
-        O->>W3: Send("worker", current_task=t3)
-        W3-->>A: WorkerResult{kg_findings, key_points, confidence}
+        O->>W3: Send t3
+        W3-->>A: WorkerResult kg_findings + key_points
     end
-    A->>A: dedupe (content_id, chunk_index); union KG by name; cap 20
-    A->>E: GeneratedAnswer with [corpus N] citations
-    E->>F: grounded ∧ useful
+    A->>A: dedupe by content_id and chunk_index, union KG by name, cap at 20
+    A->>E: GeneratedAnswer with corpus citations
+    E->>F: grounded and useful
 ```
 
 **Worker dispatch** is a single `worker_node` driven by `WorkerType` (`worker.py:60-68`):
